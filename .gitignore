@@ -1,0 +1,6 @@
+bin/
+dist/
+*.exe
+coverage.out
+.env
+samples/real/
