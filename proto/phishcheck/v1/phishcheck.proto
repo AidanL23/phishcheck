@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package phishcheck.v1;
+
+option go_package = "github.com/AidanL23/phishcheck/gen/go/phishcheck/v1;phishcheckv1";
+
+service PhishCheckService {
+  // Client stream: the first message carries the filename, and every message
+  // carries up to 64 KB of the raw .eml. The server caps the total size.
+  rpc SubmitEmail(stream SubmitEmailRequest) returns (SubmitEmailResponse);
+  rpc GetReport(GetReportRequest) returns (GetReportResponse);
+  rpc WatchReport(WatchReportRequest) returns (stream WatchReportResponse);
+}
+
+// How strongly one finding suggests phishing. Ascending, so findings sort numerically.
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0; // a rule bug; never set on purpose
+  SEVERITY_INFO = 1; // context only, never scored
+  SEVERITY_LOW = 2;
+  SEVERITY_MEDIUM = 3;
+  SEVERITY_HIGH = 4;
+}
+
+// Overall call for one email, from the score. Thresholds live in scoring.go.
+enum Verdict {
+  VERDICT_UNSPECIFIED = 0; // analysis failure; never treat as clean
+  VERDICT_CLEAN = 1;
+  VERDICT_SUSPICIOUS = 2;
+  VERDICT_LIKELY_PHISHING = 3;
+}
+
+// QUEUED -> RUNNING -> DONE or FAILED. RUNNING repeats if a crashed job is reclaimed.
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0; // unknown job
+  JOB_STATE_QUEUED = 1;
+  JOB_STATE_RUNNING = 2;
+  JOB_STATE_DONE = 3;
+  JOB_STATE_FAILED = 4;
+}
+
+message SubmitEmailRequest {
+  string filename = 1; // set on the first message only
+  bytes data = 2;
+}
+
+message Finding {
+  string rule_id = 1; // "REPLY_TO_MISMATCH"
+  Severity severity = 2;
+  string description = 3;
+  string evidence = 4; // the exact header, URL or filename that triggered it
+  int32 points = 5; // what this finding added to the score, after the cap
+}
