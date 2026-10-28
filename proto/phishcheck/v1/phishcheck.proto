@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package phishcheck.v1;
 
+import "google/protobuf/timestamp.proto";
+
 option go_package = "github.com/AidanL23/phishcheck/gen/go/phishcheck/v1;phishcheckv1";
 
 service PhishCheckService {
@@ -42,6 +44,40 @@ message SubmitEmailRequest {
   string filename = 1; // set on the first message only
   bytes data = 2;
 }
+message SubmitEmailResponse {
+  string job_id = 1;
+  string sha256 = 2;
+  int64 size_bytes = 3;
+}
+
+message GetReportRequest {
+  string job_id = 1;
+}
+
+message GetReportResponse {
+  JobStatus status = 1;
+  Report report = 2; // set only when status.state is JOB_STATE_DONE
+}
+
+message WatchReportRequest {
+  string job_id = 1;
+}
+
+message WatchReportResponse {
+  JobStatus status = 1;
+}
+
+// Where a job is in the pipeline, plus who ran it and when.
+message JobStatus {
+  string job_id = 1;
+  JobState state = 2;
+  string worker_id = 3;
+  int32 attempts = 4; // grows when a crashed job is reclaimed
+  string error = 5; // set only when state is JOB_STATE_FAILED
+  google.protobuf.Timestamp submitted_at = 6;
+  google.protobuf.Timestamp started_at = 7;
+  google.protobuf.Timestamp finished_at = 8;
+}
 
 message Finding {
   string rule_id = 1; // "REPLY_TO_MISMATCH"
@@ -49,4 +85,38 @@ message Finding {
   string description = 3;
   string evidence = 4; // the exact header, URL or filename that triggered it
   int32 points = 5; // what this finding added to the score, after the cap
+}
+
+// Metadata only; the attachment bytes never leave the worker.
+message Attachment {
+  string filename = 1; // attacker-controlled
+  string content_type = 2;
+  string sha256 = 3; // lowercase hex
+  int64 size_bytes = 4;
+}
+
+// One parsed Received header.
+message ReceivedHop {
+  int32 index = 1; // 0 = most recent hop
+  string from = 2;
+  string by = 3;
+  string with = 4;
+  string ip = 5;
+  string date = 6; // as written in the header, not parsed
+  string raw = 7; // the full header line
+}
+
+// The full analysis of one email. score is the sum of findings[].points.
+message Report {
+  string job_id = 1;
+  Verdict verdict = 2;
+  int32 score = 3;
+  repeated Finding findings = 4;
+  repeated string urls = 5; // unique, extracted as text, never fetched
+  repeated Attachment attachments = 6;
+  repeated ReceivedHop received_chain = 7;
+  string filename = 8;
+  string sha256 = 9; // of the raw .eml
+  string worker_id = 10;
+  google.protobuf.Timestamp analyzed_at = 11;
 }
