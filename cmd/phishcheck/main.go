@@ -2,6 +2,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,17 +10,24 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"text/tabwriter"
 	"time"
+	"unicode"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	pb "github.com/AidanL23/phishcheck/gen/go/phishcheck/v1"
 )
@@ -44,7 +52,10 @@ func main() {
 	switch os.Args[1] {
 	case "submit":
 		err = runSubmit(ctx, os.Args[2:])
-	// "report" and "submit-dir" land in the next checklist item.
+	case "report":
+		err = runReport(ctx, os.Args[2:])
+	case "submit-dir":
+		err = runSubmitDir(ctx, os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -58,6 +69,8 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   phishcheck submit <file.eml> [--wait] [--timeout 3m]
+  phishcheck report <job-id> [--json] [--timeout 10s]
+  phishcheck submit-dir <dir> [--wait] [--timeout 5m]
 
 environment:
   PHISHCHECK_ADDR  API address to dial (default localhost:50051)`)
@@ -84,6 +97,10 @@ func dial() (pb.PhishCheckServiceClient, *grpc.ClientConn, error) {
 	return pb.NewPhishCheckServiceClient(conn), conn, nil
 }
 
+// errUnreachable is wrapped rather than only printed, so submit-dir can
+// detect it with errors.Is and stop, instead of failing every file the same way.
+var errUnreachable = errors.New("API unreachable (is cmd/api running?)")
+
 // rpcErr turns a gRPC status into a one-line message a person can act on.
 func rpcErr(err error) error {
 	st, ok := status.FromError(err)
@@ -92,7 +109,7 @@ func rpcErr(err error) error {
 	}
 	switch st.Code() {
 	case codes.Unavailable:
-		return fmt.Errorf("API unreachable (is cmd/api running?): %s", st.Message())
+		return fmt.Errorf("%w: %s", errUnreachable, st.Message())
 	case codes.DeadlineExceeded:
 		return errors.New("timed out (raise --timeout, or check a worker is running)")
 	case codes.ResourceExhausted, codes.NotFound, codes.InvalidArgument:
@@ -147,13 +164,17 @@ func runSubmit(ctx context.Context, args []string) error {
 	// Progress goes to stderr and the job ID alone goes to stdout, so
 	// `id=$(phishcheck submit x.eml)` captures just the ID.
 	fmt.Fprintf(os.Stderr, "submitted %s: %d bytes, sha256 %s…\n",
-		filepath.Base(path), resp.GetSizeBytes(), resp.GetSha256()[:12])
+		clean(filepath.Base(path), 80), resp.GetSizeBytes(), resp.GetSha256()[:12])
 	fmt.Println(resp.GetJobId())
 
 	if !*wait {
 		return nil
 	}
-	return waitAndPrint(ctx, client, resp.GetJobId())
+	r, err := waitForReport(ctx, client, resp.GetJobId(), os.Stderr)
+	if err != nil {
+		return err
+	}
+	return printReport(os.Stdout, r)
 }
 
 // submitFile streams the file to SubmitEmail in 64 KB chunks and checks
@@ -241,12 +262,41 @@ func submitFile(ctx context.Context, client pb.PhishCheckServiceClient, path str
 	return resp, nil
 }
 
-// waitAndPrint follows the job with WatchReport, prints each state change,
-// then fetches the finished report with GetReport.
-func waitAndPrint(ctx context.Context, client pb.PhishCheckServiceClient, jobID string) error {
+// enumName strips the proto prefix: VERDICT_LIKELY_PHISHING -> LIKELY_PHISHING.
+func enumName(v fmt.Stringer, prefix string) string {
+	return strings.TrimPrefix(v.String(), prefix)
+}
+
+// clean makes attacker-controlled text safe to print in a terminal. Visible
+// characters, including quotes and non-ASCII letters, pass through. Control
+// and format characters (ESC, \r, \n, \t, U+202E) are shown as escapes, so
+// they can't move the cursor, recolor output, or reorder what you see.
+// max > 0 truncates to max runes and adds "…"; --json always keeps the full text.
+func clean(s string, max int) string {
+	var b strings.Builder
+	n := 0
+	for _, r := range s { // invalid UTF-8 arrives as U+FFFD, which prints as �
+		if max > 0 && n == max {
+			b.WriteString("…")
+			break
+		}
+		if unicode.IsGraphic(r) {
+			b.WriteRune(r)
+		} else {
+			q := strconv.QuoteRuneToGraphic(r) // e.g. '\x1b'
+			b.WriteString(q[1 : len(q)-1])     // drop the single quotes
+		}
+		n++
+	}
+	return b.String()
+}
+
+// waitForReport follows the job with WatchReport until it finishes, then
+// fetches the report with GetReport. State changes are written to progress.
+func waitForReport(ctx context.Context, client pb.PhishCheckServiceClient, jobID string, progress io.Writer) (*pb.Report, error) {
 	watch, err := client.WatchReport(ctx, &pb.WatchReportRequest{JobId: jobID})
 	if err != nil {
-		return rpcErr(err)
+		return nil, rpcErr(err)
 	}
 
 	var last *pb.JobStatus
@@ -256,42 +306,323 @@ func waitAndPrint(ctx context.Context, client pb.PhishCheckServiceClient, jobID 
 			break // the server closed the stream after DONE or FAILED
 		}
 		if err != nil {
-			return fmt.Errorf("watch: %w", rpcErr(err))
+			return nil, fmt.Errorf("watch: %w", rpcErr(err))
 		}
 		last = msg.GetStatus()
 
-		line := strings.TrimPrefix(last.GetState().String(), "JOB_STATE_")
+		line := enumName(last.GetState(), "JOB_STATE_")
 		if w := last.GetWorkerId(); w != "" {
 			line += "  worker=" + w
 		}
-		fmt.Fprintln(os.Stderr, line) // progress goes to stderr; Day 2 (§2.6) adds timings here
+		fmt.Fprintln(progress, line) // Day 2 (§2.6) adds timings here
 	}
 
 	// A closed stream doesn't prove the job finished, so check the final
-	// state explicitly. The generated getters are nil-safe: if no message
-	// arrived, last is nil and GetState() returns UNSPECIFIED.
+	// state explicitly. Getters are nil-safe: no messages means UNSPECIFIED.
 	switch last.GetState() {
 	case pb.JobState_JOB_STATE_DONE:
 		// fall through to GetReport
 	case pb.JobState_JOB_STATE_FAILED:
-		return fmt.Errorf("job %s failed: %s", jobID, last.GetError())
+		// A worker error can quote the email (a parse error, say), so clean it.
+		return nil, fmt.Errorf("job %s failed: %s", jobID, clean(last.GetError(), 200))
 	default:
-		return fmt.Errorf("watch ended with job in state %s", last.GetState())
+		return nil, fmt.Errorf("watch ended with job in state %s", last.GetState())
 	}
 
 	got, err := client.GetReport(ctx, &pb.GetReportRequest{JobId: jobID})
 	if err != nil {
-		return fmt.Errorf("get report: %w", rpcErr(err))
+		return nil, fmt.Errorf("get report: %w", rpcErr(err))
 	}
 	if got.GetReport() == nil {
-		return errors.New("job is DONE but the API returned no report") // a server bug; say so loudly
+		return nil, errors.New("job is DONE but the API returned no report") // a server bug; say so loudly
+	}
+	return got.GetReport(), nil
+}
+
+// printReport writes the human-readable report: a short header, then one
+// line per finding, highest severity first. Text that came from the email
+// goes through clean() first.
+func printReport(w io.Writer, r *pb.Report) error {
+	analyzed := "-"
+	if ts := r.GetAnalyzedAt(); ts != nil { // AsTime on nil gives 1970, which looks like real data
+		analyzed = ts.AsTime().Local().Format(time.DateTime)
+	}
+	fmt.Fprintf(w, "verdict   %s (score %d)\n", enumName(r.GetVerdict(), "VERDICT_"), r.GetScore())
+	fmt.Fprintf(w, "file      %s\n", clean(r.GetFilename(), 80))
+	fmt.Fprintf(w, "sha256    %s\n", r.GetSha256())
+	fmt.Fprintf(w, "job       %s\n", r.GetJobId())
+	fmt.Fprintf(w, "worker    %s at %s\n", r.GetWorkerId(), analyzed)
+
+	// Clone before sorting: SortStableFunc sorts in place, and the report's
+	// slice isn't this function's to reorder. Stable keeps the worker's
+	// order within the same severity.
+	findings := slices.Clone(r.GetFindings())
+	slices.SortStableFunc(findings, func(a, b *pb.Finding) int {
+		return cmp.Compare(b.GetSeverity(), a.GetSeverity()) // b before a: HIGH first
+	})
+
+	fmt.Fprintf(w, "\nfindings (%d)\n", len(findings))
+	var sum int32
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0) // aligns columns, 2-space gap
+	for _, f := range findings {
+		sum += f.GetPoints()
+		fmt.Fprintf(tw, "  %s\t%s\t+%d\t%s\n",
+			enumName(f.GetSeverity(), "SEVERITY_"),
+			clean(f.GetRuleId(), 40),
+			f.GetPoints(),
+			clean(f.GetEvidence(), 100)) // truncated here; --json has the full evidence
+	}
+	if len(findings) == 0 {
+		fmt.Fprintln(tw, "  none")
+	}
+	if err := tw.Flush(); err != nil { // tabwriter buffers: nothing prints until Flush
+		return err
 	}
 
-	// Placeholder: the next checklist item builds the full human-readable
-	// printer for `report`, and this line gets replaced with a call to it.
+	// Same idea as submit's sha256 check. The contract says the score is
+	// the sum of the findings' points. If they disagree, the worker has a
+	// scoring bug, and this is the cheapest place to notice it.
+	if sum != r.GetScore() {
+		fmt.Fprintf(os.Stderr, "warning: findings add up to %d but score is %d\n", sum, r.GetScore())
+	}
+	return nil
+}
+
+// jsonOpts controls --json output.
+var jsonOpts = protojson.MarshalOptions{
+	Multiline: true,
+	Indent:    "  ",
+	// job_id instead of jobId: matches the .proto and the worker's slog
+	// lines, so you don't have to remember two spellings in jq.
+	UseProtoNames: true,
+	// Without this, proto3 zero values are left out. A clean report would
+	// have no "score" and no "findings" at all, and `jq .score` would print null.
+	EmitUnpopulated: true,
+}
+
+// printJSON uses protojson, not encoding/json. encoding/json doesn't know
+// the proto JSON mapping: enums come out as numbers and Timestamps as
+// {seconds, nanos} objects.
+func printJSON(w io.Writer, r *pb.Report) error {
+	b, err := jsonOpts.Marshal(r)
+	if err != nil {
+		return fmt.Errorf("encode json: %w", err)
+	}
+	_, err = fmt.Fprintf(w, "%s\n", b)
+	return err
+}
+
+func runReport(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("report", flag.ExitOnError)
+	asJSON := fs.Bool("json", false, "print the full report as JSON")
+	timeout := fs.Duration("timeout", 10*time.Second, "limit for the request")
+
+	pos := parseInterspersed(fs, args) // so both `report ID --json` and `report --json ID` work
+	if len(pos) != 1 {
+		return errors.New("usage: phishcheck report <job-id> [--json]")
+	}
+	jobID := pos[0]
+
+	ctx, cancel := context.WithTimeout(ctx, *timeout)
+	defer cancel()
+
+	client, conn, err := dial()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	got, err := client.GetReport(ctx, &pb.GetReportRequest{JobId: jobID})
+	if err != nil {
+		return rpcErr(err) // NotFound covers both unknown IDs and jobs past their TTL
+	}
+
+	// Only DONE has a report. Every other state is an error with a non-zero
+	// exit and nothing on stdout, so `report $id --json | jq` fails loudly
+	// instead of quietly piping an empty object into a script.
+	st := got.GetStatus()
+	switch st.GetState() {
+	case pb.JobState_JOB_STATE_DONE:
+		// handled below
+	case pb.JobState_JOB_STATE_FAILED:
+		return fmt.Errorf("job %s failed: %s", jobID, clean(st.GetError(), 200))
+	default:
+		return fmt.Errorf("job %s is %s, no report yet (retry, or use submit --wait next time)",
+			jobID, enumName(st.GetState(), "JOB_STATE_"))
+	}
+
 	r := got.GetReport()
-	fmt.Printf("verdict=%s score=%d findings=%d worker=%s\n",
-		strings.TrimPrefix(r.GetVerdict().String(), "VERDICT_"),
-		r.GetScore(), len(r.GetFindings()), r.GetWorkerId())
+	if r == nil {
+		return errors.New("job is DONE but the API returned no report")
+	}
+	if *asJSON {
+		return printJSON(os.Stdout, r) // full, unsanitized data: machines need the exact bytes
+	}
+	return printReport(os.Stdout, r)
+}
+
+// dirResult is one file's outcome. Each wait goroutine writes only its own
+// element of the results slice, so no mutex is needed.
+type dirResult struct {
+	file   string     // base name, for display
+	jobID  string     // empty if the upload failed
+	report *pb.Report // set by --wait on success
+	err    error      // upload or wait error
+}
+
+// emlFiles lists the .eml files directly inside dir, sorted by name.
+// It uses os.ReadDir instead of filepath.Glob for two reasons: Glob treats
+// [ ] * ? in the directory name as pattern syntax, and it ignores I/O
+// errors, so a missing directory looks the same as "no files".
+func emlFiles(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir) // already sorted by filename
+	if err != nil {
+		return nil, err // "no such file or directory" / "not a directory"
+	}
+	var files []string
+	for _, e := range entries {
+		// Regular files only: skips subfolders, symlinks and sockets. It's not
+		// recursive on purpose: samples/ holds synthetic/ and real/, and you
+		// pick which one to run.
+		if e.Type().IsRegular() && strings.EqualFold(filepath.Ext(e.Name()), ".eml") {
+			files = append(files, filepath.Join(dir, e.Name()))
+		}
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no .eml files in %s", dir)
+	}
+	return files, nil
+}
+
+func runSubmitDir(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("submit-dir", flag.ExitOnError)
+	wait := fs.Bool("wait", false, "wait for every job and print a table of results")
+	timeout := fs.Duration("timeout", 5*time.Minute, "limit for the whole command, uploads plus waits")
+
+	pos := parseInterspersed(fs, args)
+	if len(pos) != 1 {
+		return errors.New("usage: phishcheck submit-dir <dir> [--wait]")
+	}
+	files, err := emlFiles(pos[0])
+	if err != nil {
+		return err // fails before any RPC
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, *timeout)
+	defer cancel()
+
+	client, conn, err := dial()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	// Phase 1: upload one file at a time. Each upload takes milliseconds
+	// locally, and going in order keeps the output in directory order.
+	results := make([]dirResult, len(files))
+	for i, path := range files {
+		results[i].file = filepath.Base(path)
+
+		resp, err := submitFile(ctx, client, path)
+		switch {
+		case err == nil:
+			results[i].jobID = resp.GetJobId()
+			fmt.Printf("%s -> %s\n", clean(results[i].file, 80), resp.GetJobId()) // stdout: the mapping only
+		case errors.Is(err, errUnreachable), ctx.Err() != nil:
+			// Not this file's fault: every remaining upload would fail the
+			// same way. Jobs already submitted stay queued and still run.
+			return fmt.Errorf("stopped at %s (file %d of %d): %w",
+				clean(results[i].file, 80), i+1, len(files), err)
+		default:
+			// This file's fault (empty, unreadable, over the size cap).
+			// Record it and keep going; one bad sample shouldn't sink the batch.
+			results[i].err = err
+			fmt.Fprintf(os.Stderr, "%s -> ERROR: %v\n", clean(results[i].file, 80), err)
+		}
+	}
+
+	if !*wait {
+		return batchErr(results)
+	}
+
+	// Phase 2: wait for every job at the same time. Waiting one by one would
+	// let a single stuck job use up the whole --timeout, and every job after
+	// it would then report "timed out" even if it finished long ago.
+	fmt.Fprintln(os.Stderr, "waiting for jobs (Ctrl+C to stop)…")
+	sem := make(chan struct{}, 16) // at most 16 WatchReport streams open at once
+	var wg sync.WaitGroup
+	for i := range results { // Go 1.22+: each iteration gets its own i
+		if results[i].err != nil {
+			continue // the upload failed; there's no job to wait for
+		}
+		wg.Go(func() { // Go 1.25+: Add(1), go, and Done in one call
+			sem <- struct{}{}        // take a slot
+			defer func() { <-sem }() // give it back
+			results[i].report, results[i].err = waitForReport(ctx, client, results[i].jobID, io.Discard)
+		})
+	}
+	wg.Wait() // also what makes it safe to read results below (happens-before)
+
+	if err := printDirTable(os.Stdout, results); err != nil {
+		return err
+	}
+	return batchErr(results)
+}
+
+// printDirTable prints one row per file in directory order, then a summary
+// on stderr of which workers did the work.
+func printDirTable(w io.Writer, results []dirResult) error {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "FILE\tVERDICT\tSCORE\tWORKER\tJOB")
+	perWorker := map[string]int{}
+	for _, res := range results {
+		name := clean(res.file, 40)
+		if res.err != nil {
+			job := res.jobID
+			if job == "" {
+				job = "-" // the upload itself failed
+			}
+			fmt.Fprintf(tw, "%s\tERROR\t-\t-\t%s\n", name, job)
+			continue
+		}
+		r := res.report
+		perWorker[r.GetWorkerId()]++
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\n",
+			name, enumName(r.GetVerdict(), "VERDICT_"), r.GetScore(), r.GetWorkerId(), res.jobID)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+
+	// Wait errors go after the table, so long messages don't stretch its
+	// columns. Upload errors were already printed in phase 1.
+	for _, res := range results {
+		if res.err != nil && res.jobID != "" {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", clean(res.file, 40), res.err)
+		}
+	}
+
+	// The Day 6 two-replica proof: two worker names here means the consumer
+	// group spread the jobs across both replicas.
+	var parts []string
+	for _, id := range slices.Sorted(maps.Keys(perWorker)) {
+		parts = append(parts, fmt.Sprintf("%s=%d", id, perWorker[id]))
+	}
+	fmt.Fprintf(os.Stderr, "\n%d files, %d workers: %s\n", len(results), len(perWorker), strings.Join(parts, " "))
+	return nil
+}
+
+// batchErr makes the exit code non-zero if any file failed, so a CI step
+// or script running submit-dir notices.
+func batchErr(results []dirResult) error {
+	failed := 0
+	for _, r := range results {
+		if r.err != nil {
+			failed++
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d of %d files failed", failed, len(results))
+	}
 	return nil
 }
