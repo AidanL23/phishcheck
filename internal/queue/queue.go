@@ -88,7 +88,7 @@ func (c *Consumer) EnsureGroup(ctx context.Context) error {
 	return nil // BUSYGROUP means the group already exists
 }
 
-// Next blocks up to blockFor for one new job. It returns errNoJob on timeout
+// Next blocks up to blockFor for one new job. It returns ErrNoJob on timeout
 // and the context's error if ctx is canceled while waiting.
 // The returned job stays pending until Ack is called
 func (c *Consumer) Next(ctx context.Context) (Job, error) {

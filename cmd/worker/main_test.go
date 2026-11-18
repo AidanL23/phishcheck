@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"regexp"
 	"testing"
 	"time"
+
+	"github.com/AidanL23/phishcheck/internal/queue"
 )
 
 func TestNewWorkerID(t *testing.T) {
@@ -70,5 +74,33 @@ func TestRedisLoggerWritesJSON(t *testing.T) {
 	if line["level"] != "WARN" || line["component"] != "go-redis" ||
 		line["msg"] != "redis: dial localhost:6379: refused" {
 		t.Errorf("got %v", line)
+	}
+}
+
+func TestNextStep(t *testing.T) {
+	redisDown := errors.New("queue: read: dial tcp: connection refused")
+	tests := []struct {
+		name     string
+		err      error
+		stopping bool
+		want     step
+	}{
+		{"got a job", nil, false, stepHandle},
+		// The Day 1 bug: SIGTERM landing after XREADGROUP returned an entry
+		// used to skip it, leaving it pending and unacked with nobody to run it.
+		{"got a job, then shutdown started", nil, true, stepHandle},
+		{"idle", queue.ErrNoJob, false, stepIdle},
+		{"idle at shutdown", queue.ErrNoJob, true, stepIdle},
+		{"read interrupted by shutdown", fmt.Errorf("queue: read: %w", context.Canceled), true, stepStop},
+		{"redis error", redisDown, false, stepBackoff},
+		// Not a Redis outage: warn and keep reading, no 1 s backoff.
+		{"malformed entry", fmt.Errorf("%w: entry 1-0", queue.ErrMalformedEntry), false, stepSkip},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := nextStep(tt.err, tt.stopping); got != tt.want {
+				t.Errorf("nextStep(%v, %v) = %d, want %d", tt.err, tt.stopping, got, tt.want)
+			}
+		})
 	}
 }

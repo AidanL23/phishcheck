@@ -79,6 +79,8 @@ pending_count() { rcli XPENDING phishcheck:jobs workers | sed -n 1p; }
 log_has() { grep -q "$2" "$WORK/$1.log"; }
 # rejected_with TEXT: the last cli call failed and its stderr contains TEXT.
 rejected_with() { [ "$RC" -ne 0 ] && grep -q "$1" <<<"$ERR"; }
+# no_raw_controls: the last cli call failed and printed no raw ESC or CR.
+no_raw_controls() { [ "$RC" -ne 0 ] && [[ $OUT$ERR != *$'\e'* && $OUT$ERR != *$'\r'* ]] && grep -qF '\x1b[31mINVOICE' <<<"$ERR"; }
 no_pending() { [ "$(pending_count)" = "0" ]; }
 all_json() { jq -e . "$1" >/dev/null; }
 # jqr FILTER: jq -e on report.json, quietly (exit status only).
@@ -195,6 +197,15 @@ check "a rejected upload creates no job" [ "$(job_count)" = "$BEFORE" ]
 cli submit "$WORK/empty.eml"
 check "empty file is rejected before upload" rejected_with "is empty"
 
+# A Subject-derived file name with an escape sequence and a CR in it. Every
+# error that repeats the path must print it cleaned.
+mkdir "$WORK/evil"
+EVIL="$WORK/evil/"$'\e[31mINVOICE\e[0m\r.eml'
+: >"$EVIL"
+cli submit "$EVIL"
+check "submit: path in the error is cleaned" no_raw_controls
+cli submit-dir "$WORK/evil"
+check "submit-dir: path in the error is cleaned" no_raw_controls
 
 # ---- bad job IDs -------------------------------------------------------------
 
@@ -204,6 +215,9 @@ cli report not-a-uuid
 check "non-UUID is rejected" rejected_with "must be a UUID"
 cli report 00000000-0000-4000-8000-000000000000
 check "unknown UUID is NotFound" rejected_with "not found or expired"
+cli report "$(tr 'a-f' 'A-F' <<<"$JOB")" --json
+check "an uppercase copy of a real ID finds the job" [ "$RC" -eq 0 ]
+check "and the report gives the canonical lowercase ID" [ "$(jq -r .job_id <<<"$OUT")" = "$JOB" ]
 
 # ---- worker failure paths ----------------------------------------------------
 
@@ -219,7 +233,8 @@ check "report shows the failure reason" rejected_with "failed: get email"
 
 # An entry with no job_id at all: Next acks it so it can't sit pending forever.
 rcli XADD phishcheck:jobs '*' not_a_job_id x >/dev/null
-check "malformed entry is logged" wait_for 10 log_has worker 'malformed entry'
+check "malformed entry is skipped with a WARN, not a read error" wait_for 10 log_has worker '"level":"WARN","msg":"skipped malformed stream entry"'
+check "and no read-error backoff was triggered" bash -c "! grep -q '\"msg\":\"read from stream\"' '$WORK/worker.log'"
 check "nothing left pending" wait_for 5 no_pending
 
 cli submit "$SAMPLE" --wait

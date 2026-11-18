@@ -43,8 +43,9 @@ func main() {
 }
 
 func run() error {
-	// ctx is cancelled on Ctrl+C or `docker stop` (SIGTERM). Letting the
-	// in-flight job finish before exiting is §2.7, not today.
+	// ctx is cancelled on Ctrl+C or `docker stop` (SIGTERM). It stops the
+	// loop from reading new jobs; a job already read still runs to the end
+	// (see handle). The rest of graceful shutdown is §2.7.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -92,21 +93,28 @@ func run() error {
 	logger.Info("worker ready")
 
 	for {
-		// Check for shutdown between jobs, never in the middle of one.
+		// Shutdown is checked here, between jobs. It can't interrupt a job
+		// that has been read: nextStep always hands it to handle, and handle
+		// runs it on a context the signal doesn't cancel.
 		if ctx.Err() != nil {
 			logger.Info("worker stopping")
 			return nil
 		}
 
 		msg, err := q.Next(ctx) // blocks for up to 5 s
-		switch {
-		case errors.Is(err, queue.ErrNoJob):
+		switch nextStep(err, ctx.Err() != nil) {
+		case stepIdle:
 			// The BLOCK timed out with nothing to read. Normal while idle; don't log it.
 			continue
-		case ctx.Err() != nil:
+		case stepStop:
 			// Shutdown interrupted the blocking read. The top of the loop exits.
 			continue
-		case err != nil:
+		case stepSkip:
+			// Next already acked the bad entry. One bad entry says nothing
+			// about Redis's health, so warn and read the next one right away.
+			logger.Warn("skipped malformed stream entry", "error", err)
+			continue
+		case stepBackoff:
 			// Redis or network error. Back off so a dead connection
 			// doesn't turn into a hot loop that floods the log.
 			logger.Error("read from stream", "error", err)
@@ -114,28 +122,77 @@ func run() error {
 			continue
 		}
 
-		handle(ctx, logger, st, q, workerID, msg)
+		handle(context.WithoutCancel(ctx), logger, st, q, workerID, msg)
 	}
 }
 
+// step is what the worker loop does with one result from Next.
+type step int
+
+const (
+	stepHandle  step = iota // got a job: run it, even if shutdown has started
+	stepIdle                // the BLOCK timed out with nothing to read
+	stepStop                // shutdown interrupted the blocking read
+	stepSkip                // an entry with no job_id, already acked by Next
+	stepBackoff             // Redis or network error
+)
+
+// nextStep decides what the loop does with Next's result. A job that was
+// read is always handled, even if the signal arrived a moment later: Next
+// has already put it in this consumer's pending list, and with no reclaim
+// until Day 2, nothing else would ever run it or ack it.
+func nextStep(err error, stopping bool) step {
+	switch {
+	case err == nil:
+		return stepHandle
+	case errors.Is(err, queue.ErrNoJob):
+		return stepIdle
+	case errors.Is(err, queue.ErrMalformedEntry):
+		return stepSkip
+	case stopping:
+		return stepStop
+	default:
+		return stepBackoff
+	}
+}
+
+const (
+	// jobTimeout bounds process, so a hung Redis call fails the job instead
+	// of stalling the worker. On shutdown, Docker's SIGKILL 10 s after
+	// SIGTERM is still the hard limit.
+	jobTimeout = 30 * time.Second
+	// finishTimeout bounds the FAILED write and the XACK. They get their own
+	// deadline, so a job that hit jobTimeout is still recorded and acked.
+	finishTimeout = 5 * time.Second
+)
+
 // handle runs one job, writes exactly one summary log line, and acks.
 // Day 1 acks success and failure alike. §2.2 changes that.
+//
+// ctx must not be the shutdown context (run passes context.WithoutCancel).
+// If SIGTERM cancelled these Redis calls partway through, the job would be
+// left RUNNING with its entry unacked.
 func handle(ctx context.Context, logger *slog.Logger, st *store.Store, q *queue.Consumer,
 	workerID string, msg queue.Job) {
 
 	start := time.Now()
 	logger = logger.With("job_id", msg.JobID)
 
-	err := process(ctx, st, workerID, msg.JobID)
+	jobCtx, cancelJob := context.WithTimeout(ctx, jobTimeout)
+	err := process(jobCtx, st, workerID, msg.JobID)
+	cancelJob()
 
 	// Convert to integer milliseconds. slog's JSON handler writes a
 	// time.Duration as nanoseconds.
 	durationMS := time.Since(start).Milliseconds()
 
+	finishCtx, cancelFinish := context.WithTimeout(ctx, finishTimeout)
+	defer cancelFinish()
+
 	if err != nil {
 		// Record why it failed so GetReport/WatchReport can show the reason.
 		f := store.JobFields{WorkerID: workerID, Error: err.Error()}
-		if serr := st.SetJobState(ctx, msg.JobID, pb.JobState_JOB_STATE_FAILED, f); serr != nil {
+		if serr := st.SetJobState(finishCtx, msg.JobID, pb.JobState_JOB_STATE_FAILED, f); serr != nil {
 			logger.Error("set FAILED state", "error", serr)
 		}
 		logger.Error("job failed", "duration_ms", durationMS, "error", err)
@@ -145,7 +202,7 @@ func handle(ctx context.Context, logger *slog.Logger, st *store.Store, q *queue.
 
 	// XACK removes the entry from the Pending Entries List. Without it,
 	// the job stays owned by this worker forever.
-	if err := q.Ack(ctx, msg.StreamID); err != nil {
+	if err := q.Ack(finishCtx, msg.StreamID); err != nil {
 		logger.Error("ack", "stream_id", msg.StreamID, "error", err)
 	}
 }

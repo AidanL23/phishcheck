@@ -61,7 +61,10 @@ func main() {
 		os.Exit(2)
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "phishcheck:", err)
+		// Clean the whole message, not just the names in it: errors like
+		// *os.PathError embed the file path, and saved .eml files are often
+		// named after the email's Subject.
+		fmt.Fprintln(os.Stderr, "phishcheck:", clean(err.Error(), 0))
 		os.Exit(1)
 	}
 }
@@ -197,6 +200,13 @@ func submitFile(ctx context.Context, client pb.PhishCheckServiceClient, path str
 	if info.Size() == 0 {
 		return nil, fmt.Errorf("%s is empty", path)
 	}
+
+	// The stream gets its own context. Every early return below (a read
+	// error, a failed Send) skips CloseAndRecv, and gRPC keeps a stream open
+	// until its context ends. Without this, submit-dir would leave it open,
+	// and the server holding the partial upload, until the whole command ended.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	stream, err := client.SubmitEmail(ctx)
 	if err != nil {
@@ -456,7 +466,11 @@ func runReport(ctx context.Context, args []string) error {
 		return errors.New("job is DONE but the API returned no report")
 	}
 	if *asJSON {
-		return printJSON(os.Stdout, r) // full, unsanitized data: machines need the exact bytes
+		// Full, uncleaned data: machines need the exact bytes. JSON escaping
+		// covers C0 controls (ESC, CR, LF) but not bidi overrides like U+202E
+		// or C1 controls like U+009B, so this output is for jq and scripts,
+		// not for reading raw in a terminal.
+		return printJSON(os.Stdout, r)
 	}
 	return printReport(os.Stdout, r)
 }
@@ -531,13 +545,16 @@ func runSubmitDir(ctx context.Context, args []string) error {
 		case errors.Is(err, errUnreachable), ctx.Err() != nil:
 			// Not this file's fault: every remaining upload would fail the
 			// same way. Jobs already submitted stay queued and still run.
+			// main cleans the whole message, including err's copy of the path.
 			return fmt.Errorf("stopped at %s (file %d of %d): %w",
 				clean(results[i].file, 80), i+1, len(files), err)
 		default:
 			// This file's fault (empty, unreadable, over the size cap).
 			// Record it and keep going; one bad sample shouldn't sink the batch.
 			results[i].err = err
-			fmt.Fprintf(os.Stderr, "%s -> ERROR: %v\n", clean(results[i].file, 80), err)
+			// err usually repeats the full path ("<path> is empty"), so it
+			// needs clean() as much as the name does.
+			fmt.Fprintf(os.Stderr, "%s -> ERROR: %s\n", clean(results[i].file, 80), clean(err.Error(), 0))
 		}
 	}
 
@@ -598,7 +615,7 @@ func printDirTable(w io.Writer, results []dirResult) error {
 	// columns. Upload errors were already printed in phase 1.
 	for _, res := range results {
 		if res.err != nil && res.jobID != "" {
-			fmt.Fprintf(os.Stderr, "%s: %v\n", clean(res.file, 40), res.err)
+			fmt.Fprintf(os.Stderr, "%s: %s\n", clean(res.file, 40), clean(res.err.Error(), 0))
 		}
 	}
 

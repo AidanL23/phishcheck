@@ -240,6 +240,32 @@ func TestEmlFiles(t *testing.T) {
 	})
 }
 
+// A file name is attacker-influenced (mail clients name a saved .eml after
+// its Subject), and submitFile's errors repeat the full path. The per-file
+// ERROR line must clean the error, not only the name in front of it.
+func TestSubmitDirCleansErrors(t *testing.T) {
+	dir := t.TempDir()
+	evil := "\x1b[31mINVOICE\x1b[0m\r.eml"
+	if err := os.WriteFile(filepath.Join(dir, evil), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The empty file fails before any RPC, and grpc.NewClient doesn't
+	// connect, so nothing is dialed.
+	t.Setenv("PHISHCHECK_ADDR", "127.0.0.1:1")
+
+	var err error
+	stderr := captureStderr(t, func() { err = runSubmitDir(context.Background(), []string{dir}) })
+	if err == nil || err.Error() != "1 of 1 files failed" {
+		t.Errorf("err = %v", err)
+	}
+	if strings.ContainsAny(stderr, "\x1b\r") {
+		t.Errorf("raw control characters reached stderr: %q", stderr)
+	}
+	if !strings.Contains(stderr, `\x1b[31mINVOICE\x1b[0m\r.eml is empty`) {
+		t.Errorf("want the cleaned path in the error, got %q", stderr)
+	}
+}
+
 func TestBatchErr(t *testing.T) {
 	if err := batchErr([]dirResult{{}, {}}); err != nil {
 		t.Errorf("all ok: got %v", err)
@@ -620,6 +646,20 @@ func TestSubmitFileErrors(t *testing.T) {
 			t.Errorf("got %v", err)
 		}
 	})
+}
+
+// gRPC keeps a client stream open until its context ends. On an early
+// return, submitFile skips CloseAndRecv, so it must cancel the stream itself
+// rather than leave it to the caller's (possibly minutes-long) context.
+func TestSubmitFileEndsStreamOnEarlyReturn(t *testing.T) {
+	c := &fakeClient{submit: &fakeSubmitStream{sendErr: errors.New("marshal failed")}}
+	_, err := submitFile(context.Background(), c, writeFile(t, "x.eml", []byte("hello")))
+	if err == nil || !strings.Contains(err.Error(), "send chunk") {
+		t.Fatalf("got %v", err)
+	}
+	if c.submitCtx == nil || c.submitCtx.Err() == nil {
+		t.Error("stream context still live after submitFile returned: the stream leaks")
+	}
 }
 
 func watchMsg(state pb.JobState, worker, errMsg string) *pb.WatchReportResponse {

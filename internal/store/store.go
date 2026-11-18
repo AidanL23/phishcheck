@@ -85,7 +85,7 @@ type Job struct {
 // SetJobState updates the job hash at phishcheck:job:{id} and refreshes its TTL.
 // Empty fields in f are skipped, so earlier values (like filename) are kept.
 func (s *Store) SetJobState(ctx context.Context, id string, state pb.JobState, f JobFields) error {
-	values := map[string]any{fieldState: state.String()} // stored as "JOB_STATE_QUEUED for readability"
+	values := map[string]any{fieldState: state.String()} // stored as "JOB_STATE_QUEUED", for readability
 
 	if f.WorkerID != "" {
 		values[fieldWorkerID] = f.WorkerID
@@ -101,8 +101,10 @@ func (s *Store) SetJobState(ctx context.Context, id string, state pb.JobState, f
 	}
 
 	key := jobKey(id)
-	// HSET takes no TTL, so EXPIRE follows it. MULTI/EXEC applies both or neither,
-	// so the hash can never be left without an expiry.
+	// HSET takes no TTL, so EXPIRE follows it. MULTI/EXEC runs the two back to
+	// back with no other command in between (Redis doesn't roll back, but
+	// EXPIRE can't fail on a key HSET just wrote), so the hash can never be
+	// left without an expiry.
 	_, err := s.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
 		p.HSet(ctx, key, values)
 		p.Expire(ctx, key, s.ttl)

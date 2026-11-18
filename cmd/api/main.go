@@ -33,7 +33,7 @@ func main() {
 		slog.Error("invalid configuration", "err", err)
 		os.Exit(1)
 	}
-	slog.Info("starting api", "config", cfg) // your LogValue redacts the password
+	slog.Info("starting api", "config", cfg) // Config.LogValue redacts the password
 
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     cfg.RedisAddr,

@@ -1,15 +1,21 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"log/slog"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/AidanL23/phishcheck/gen/go/phishcheck/v1"
+	"github.com/AidanL23/phishcheck/internal/queue"
 	"github.com/AidanL23/phishcheck/internal/store"
 )
 
@@ -62,6 +68,25 @@ func TestLookupJobRejectsNonUUID(t *testing.T) {
 	}
 }
 
+func TestNormalizeJobID(t *testing.T) {
+	const want = "6f1c2e8a-0000-4000-8000-00000000abcd"
+	for _, in := range []string{
+		want,
+		"6F1C2E8A-0000-4000-8000-00000000ABCD", // pasted from a tool that uppercases
+		"{6f1c2e8a-0000-4000-8000-00000000abcd}",
+		"urn:uuid:6f1c2e8a-0000-4000-8000-00000000abcd",
+		"6f1c2e8a00004000800000000000abcd",
+	} {
+		got, err := normalizeJobID(in)
+		if err != nil || got != want {
+			t.Errorf("normalizeJobID(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	if _, err := normalizeJobID("nope"); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("bad ID: got %v", err)
+	}
+}
+
 func TestGetAndWatchRejectBadID(t *testing.T) {
 	s := New(nil, nil, 1)
 	if _, err := s.GetReport(context.Background(), &pb.GetReportRequest{JobId: "nope"}); status.Code(err) != codes.InvalidArgument {
@@ -97,6 +122,18 @@ func TestSubmitEmailRejections(t *testing.T) {
 			nil, codes.ResourceExhausted, 3,
 		},
 		{"client error is passed through", nil, status.Error(codes.Canceled, "gone"), codes.Canceled, 0},
+		{
+			"filename over 255 bytes",
+			[]*pb.SubmitEmailRequest{chunk(strings.Repeat("a", maxFilenameBytes+1), 1)},
+			nil, codes.InvalidArgument, 1,
+		},
+		{
+			// Gets past the filename check (exactly 255 is fine) and is then
+			// stopped by the size cap, before the nil store is touched.
+			"filename of exactly 255 bytes is accepted",
+			[]*pb.SubmitEmailRequest{chunk(strings.Repeat("a", maxFilenameBytes), max+1)},
+			nil, codes.ResourceExhausted, 1,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -114,6 +151,80 @@ func TestSubmitEmailRejections(t *testing.T) {
 		})
 	}
 }
+
+func TestSubmitEmailUploadTimeout(t *testing.T) {
+	// A client that opens the stream and never finishes. Recv blocks until
+	// the stream's context ends, as it does in gRPC.
+	ctx, endRPC := context.WithCancel(context.Background())
+	ss := &stalledSubmitServer{ctx: ctx, returned: make(chan struct{})}
+	s := New(nil, nil, 10)
+	s.uploadTimeout = 20 * time.Millisecond
+
+	start := time.Now()
+	err := s.SubmitEmail(ss)
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("got %v, want DeadlineExceeded", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("took %s; the timeout is 20ms", d)
+	}
+
+	// gRPC cancels the stream once the handler returns. The receive
+	// goroutine must then exit, not leak.
+	endRPC()
+	select {
+	case <-ss.returned:
+	case <-time.After(time.Second):
+		t.Fatal("receive goroutine still blocked after the RPC ended")
+	}
+}
+
+// After the upload, the client hangs up before the Redis writes finish.
+// That is a Canceled, not an Internal server fault, and not an ERROR log.
+func TestSubmitEmailClientCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// A real client, but go-redis checks the context before it takes a
+	// connection, so with ctx already cancelled nothing is dialed.
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
+	defer rdb.Close()
+	st, err := store.New(rdb, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	defer slog.SetDefault(old)
+
+	ss := &fakeSubmitServer{ctx: ctx, reqs: []*pb.SubmitEmailRequest{{Filename: "a.eml", Data: []byte("x")}}}
+	err = New(st, queue.NewProducer(rdb), 10).SubmitEmail(ss)
+	if status.Code(err) != codes.Canceled {
+		t.Errorf("got %v, want Canceled", err)
+	}
+	if strings.Contains(logs.String(), `"level":"ERROR"`) {
+		t.Errorf("a client hang-up was logged as a server error:\n%s", logs.String())
+	}
+}
+
+// stalledSubmitServer's Recv blocks until ctx ends, then reports it.
+type stalledSubmitServer struct {
+	grpc.ServerStream
+	ctx      context.Context
+	returned chan struct{}
+}
+
+func (f *stalledSubmitServer) Context() context.Context { return f.ctx }
+
+func (f *stalledSubmitServer) Recv() (*pb.SubmitEmailRequest, error) {
+	<-f.ctx.Done()
+	close(f.returned)
+	return nil, status.FromContextError(f.ctx.Err()).Err()
+}
+
+func (f *stalledSubmitServer) SendAndClose(*pb.SubmitEmailResponse) error { return nil }
 
 // fakeSubmitServer feeds SubmitEmail a fixed list of messages, then io.EOF
 // (or err, if set).
