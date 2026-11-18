@@ -1,0 +1,16 @@
+Received: from mail.example.org (mail.example.org [192.0.2.10])
+        by mx.example.com with ESMTPS; Tue, 17 Nov 2026 14:02:11 +0000
+Authentication-Results: mx.example.com; spf=pass smtp.mailfrom=example.org; dkim=pass header.d=example.org; dmarc=pass header.from=example.org
+From: Alice Example <alice@example.org>
+To: user@example.com
+Subject: Lunch on Thursday?
+Date: Tue, 17 Nov 2026 14:02:05 +0000
+Message-ID: <clean-sample-001@example.org>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+
+Hi,
+
+Are you free for lunch on Thursday? The usual place at noon works for me.
+
+Alice
