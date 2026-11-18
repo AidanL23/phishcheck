@@ -1,9 +1,45 @@
 package config
 
 import (
+	"bytes"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 )
+
+// Load promises every invalid variable at once, so one bad deploy is one fix.
+func TestLoadReportsEveryBadVariable(t *testing.T) {
+	_, err := load(env(map[string]string{
+		"PHISHCHECK_MAX_EMAIL_BYTES": "lots",
+		"PHISHCHECK_TTL":             "forever",
+		"PHISHCHECK_DNS_TIMEOUT":     "-1s",
+	}))
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	for _, key := range []string{"PHISHCHECK_MAX_EMAIL_BYTES", "PHISHCHECK_TTL", "PHISHCHECK_DNS_TIMEOUT"} {
+		if !strings.Contains(err.Error(), key) {
+			t.Errorf("error does not mention %s:\n%v", key, err)
+		}
+	}
+}
+
+func TestLogValueRedactsPassword(t *testing.T) {
+	cfg, err := load(env(map[string]string{"REDIS_PASSWORD": "hunter2-secret"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("starting", "config", cfg)
+	out := buf.String()
+	if strings.Contains(out, "hunter2-secret") {
+		t.Fatalf("password leaked into the log line:\n%s", out)
+	}
+	if !strings.Contains(out, `"redis_password_set":true`) {
+		t.Errorf("want redis_password_set:true in:\n%s", out)
+	}
+}
 
 func env(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }

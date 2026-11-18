@@ -28,3 +28,15 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - run: go test ./...
+
+  # The Day 1 slice end to end: real Redis (a container the script starts),
+  # real API and worker, driven through the CLI. ubuntu-latest has docker,
+  # jq and a C compiler, so the binaries are built with -race here.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: ./scripts/e2e.sh
