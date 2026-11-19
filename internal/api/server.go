@@ -248,6 +248,7 @@ func toStatus(j *store.Job) *pb.JobStatus {
 		JobId:    j.ID,
 		State:    j.State,
 		WorkerId: j.WorkerID,
+		Attempts: j.Attempts,
 		Error:    j.Error,
 	}
 }

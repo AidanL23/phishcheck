@@ -1,13 +1,12 @@
-// Command worker reads job IDs from the phishcheck:jobs stream, analyzes the
-// stored email, and writes a Report. On Day 1 the analysis is a stub: every
-// email comes back VERDICT_CLEAN with score 0. The point today is to prove the
-// pipeline works end to end.
+// Command worker reads job IDs from the phishcheck:jobs stream and hands each
+// one to internal/worker, which analyzes the stored email, writes the Report,
+// and decides whether to ack. The analysis is still a stub until Day 3: every
+// email comes back VERDICT_CLEAN with score 0.
 package main
 
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -18,12 +17,11 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
-	"google.golang.org/protobuf/types/known/timestamppb"
 
-	pb "github.com/AidanL23/phishcheck/gen/go/phishcheck/v1"
 	"github.com/AidanL23/phishcheck/internal/config"
 	"github.com/AidanL23/phishcheck/internal/queue"
 	"github.com/AidanL23/phishcheck/internal/store"
+	"github.com/AidanL23/phishcheck/internal/worker"
 )
 
 func main() {
@@ -45,7 +43,7 @@ func main() {
 func run() error {
 	// ctx is cancelled on Ctrl+C or `docker stop` (SIGTERM). It stops the
 	// loop from reading new jobs; a job already read still runs to the end
-	// (see handle). The rest of graceful shutdown is §2.7.
+	// (see worker.Handle). The rest of graceful shutdown is §2.7.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -90,11 +88,13 @@ func run() error {
 		return fmt.Errorf("ensure group: %w", err)
 	}
 
+	// One Worker for the process. §2.3's reclaim goroutine will share it.
+	w := worker.New(st, q, workerID, logger)
 	logger.Info("worker ready")
 
 	for {
 		// Shutdown is checked here, between jobs. It can't interrupt a job
-		// that has been read: nextStep always hands it to handle, and handle
+		// that has been read: nextStep always hands it to w.Handle, which
 		// runs it on a context the signal doesn't cancel.
 		if ctx.Err() != nil {
 			logger.Info("worker stopping")
@@ -122,7 +122,7 @@ func run() error {
 			continue
 		}
 
-		handle(context.WithoutCancel(ctx), logger, st, q, workerID, msg)
+		w.Handle(context.WithoutCancel(ctx), msg)
 	}
 }
 
@@ -139,8 +139,8 @@ const (
 
 // nextStep decides what the loop does with Next's result. A job that was
 // read is always handled, even if the signal arrived a moment later: Next
-// has already put it in this consumer's pending list, and with no reclaim
-// until Day 2, nothing else would ever run it or ack it.
+// has already put it in this consumer's pending list, and until the reclaim
+// loop exists (§2.3), nothing else would ever run it or ack it.
 func nextStep(err error, stopping bool) step {
 	switch {
 	case err == nil:
@@ -154,100 +154,6 @@ func nextStep(err error, stopping bool) step {
 	default:
 		return stepBackoff
 	}
-}
-
-const (
-	// jobTimeout bounds process, so a hung Redis call fails the job instead
-	// of stalling the worker. On shutdown, Docker's SIGKILL 10 s after
-	// SIGTERM is still the hard limit.
-	jobTimeout = 30 * time.Second
-	// finishTimeout bounds the FAILED write and the XACK. They get their own
-	// deadline, so a job that hit jobTimeout is still recorded and acked.
-	finishTimeout = 5 * time.Second
-)
-
-// handle runs one job, writes exactly one summary log line, and acks.
-// Day 1 acks success and failure alike. §2.2 changes that.
-//
-// ctx must not be the shutdown context (run passes context.WithoutCancel).
-// If SIGTERM cancelled these Redis calls partway through, the job would be
-// left RUNNING with its entry unacked.
-func handle(ctx context.Context, logger *slog.Logger, st *store.Store, q *queue.Consumer,
-	workerID string, msg queue.Job) {
-
-	start := time.Now()
-	logger = logger.With("job_id", msg.JobID)
-
-	jobCtx, cancelJob := context.WithTimeout(ctx, jobTimeout)
-	err := process(jobCtx, st, workerID, msg.JobID)
-	cancelJob()
-
-	// Convert to integer milliseconds. slog's JSON handler writes a
-	// time.Duration as nanoseconds.
-	durationMS := time.Since(start).Milliseconds()
-
-	finishCtx, cancelFinish := context.WithTimeout(ctx, finishTimeout)
-	defer cancelFinish()
-
-	if err != nil {
-		// Record why it failed so GetReport/WatchReport can show the reason.
-		f := store.JobFields{WorkerID: workerID, Error: err.Error()}
-		if serr := st.SetJobState(finishCtx, msg.JobID, pb.JobState_JOB_STATE_FAILED, f); serr != nil {
-			logger.Error("set FAILED state", "error", serr)
-		}
-		logger.Error("job failed", "duration_ms", durationMS, "error", err)
-	} else {
-		logger.Info("job done", "duration_ms", durationMS)
-	}
-
-	// XACK removes the entry from the Pending Entries List. Without it,
-	// the job stays owned by this worker forever.
-	if err := q.Ack(finishCtx, msg.StreamID); err != nil {
-		logger.Error("ack", "stream_id", msg.StreamID, "error", err)
-	}
-}
-
-// process does the job itself: RUNNING -> read job + email -> stub report -> DONE.
-// Each error is wrapped with the step that failed, so the FAILED reason reads
-// like "get email: ..." and not just "redis: nil".
-func process(ctx context.Context, st *store.Store, workerID, jobID string) error {
-	running := store.JobFields{WorkerID: workerID}
-	if err := st.SetJobState(ctx, jobID, pb.JobState_JOB_STATE_RUNNING, running); err != nil {
-		return fmt.Errorf("set RUNNING: %w", err)
-	}
-
-	// The API saved the filename in the job hash when it accepted the upload.
-	job, err := st.GetJob(ctx, jobID)
-	if err != nil {
-		return fmt.Errorf("get job: %w", err)
-	}
-
-	raw, err := st.GetEmail(ctx, jobID)
-	if err != nil {
-		return fmt.Errorf("get email: %w", err)
-	}
-	sum := sha256.Sum256(raw) // hash of the bytes actually analyzed
-
-	// Stub report. Real findings start on Day 3.
-	report := &pb.Report{
-		JobId:      jobID,
-		Verdict:    pb.Verdict_VERDICT_CLEAN,
-		Score:      0,
-		Filename:   job.Filename,
-		Sha256:     hex.EncodeToString(sum[:]),
-		WorkerId:   workerID, // which replica did the work (the Day 6 proof)
-		AnalyzedAt: timestamppb.Now(),
-	}
-	if err := st.PutReport(ctx, jobID, report); err != nil {
-		return fmt.Errorf("put report: %w", err)
-	}
-
-	// Set DONE last: once the state says DONE, GetReport expects the report to exist.
-	done := store.JobFields{WorkerID: workerID}
-	if err := st.SetJobState(ctx, jobID, pb.JobState_JOB_STATE_DONE, done); err != nil {
-		return fmt.Errorf("set DONE: %w", err)
-	}
-	return nil
 }
 
 // newWorkerID returns "<hostname>-<4 hex chars>", e.g. "LAPTOP-KB519V12-3f9a".

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -28,6 +29,7 @@ const (
 	fieldError    = "error"
 	fieldFilename = "filename"
 	fieldSHA256   = "sha256"
+	fieldAttempts = "attempts"
 )
 
 type Store struct {
@@ -80,6 +82,7 @@ type Job struct {
 	Error    string
 	Filename string
 	SHA256   string
+	Attempts int32
 }
 
 // SetJobState updates the job hash at phishcheck:job:{id} and refreshes its TTL.
@@ -133,6 +136,15 @@ func (s *Store) GetJob(ctx context.Context, id string) (*Job, error) {
 		return nil, fmt.Errorf("store: job %s has unknown state %q", id, m[fieldState])
 	}
 
+	// attempts is missing until the first StartAttempt, which reads as 0.
+	var attempts int64
+	if v := m[fieldAttempts]; v != "" {
+		attempts, err = strconv.ParseInt(v, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("store: job %s has bad attempts %q: %w", id, v, err)
+		}
+	}
+
 	return &Job{
 		ID:       id,
 		State:    pb.JobState(state),
@@ -140,7 +152,32 @@ func (s *Store) GetJob(ctx context.Context, id string) (*Job, error) {
 		Error:    m[fieldError],
 		Filename: m[fieldFilename],
 		SHA256:   m[fieldSHA256],
+		Attempts: int32(attempts),
 	}, nil
+}
+
+// StartAttempt marks the job RUNNING on workerID and adds 1 to its attempts
+// counter, returning the new count (1 on the first run, 2 after one reclaim).
+// It also clears the error left by a previous attempt, so a job that panicked
+// once and then succeeds doesn't show a stale error next to DONE.
+//
+// All four commands run in one MULTI/EXEC: the count can't go up without the
+// state changing with it, and the hash keeps its TTL.
+func (s *Store) StartAttempt(ctx context.Context, id, workerID string) (int64, error) {
+	key := jobKey(id)
+	var incr *redis.IntCmd // filled in when the transaction runs
+	_, err := s.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
+		p.HSet(ctx, key, fieldState, pb.JobState_JOB_STATE_RUNNING.String(), fieldWorkerID, workerID)
+		p.HDel(ctx, key, fieldError)
+		incr = p.HIncrBy(ctx, key, fieldAttempts, 1)
+		p.Expire(ctx, key, s.ttl)
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("store: start attempt %s: %w", id, err)
+	}
+	// Inside a pipeline, Val() is only valid after EXEC has returned.
+	return incr.Val(), nil
 }
 
 // PutReport stores the report as protobuf bytes under phishcheck:report:{id} with the store's TTL.
