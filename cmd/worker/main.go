@@ -88,8 +88,12 @@ func run() error {
 		return fmt.Errorf("ensure group: %w", err)
 	}
 
-	// One Worker for the process. §2.3's reclaim goroutine will share it.
+	// Shared by this loop and the reclaim goroutine; safe without a lock.
 	w := worker.New(st, q, workerID, logger)
+
+	// Retries or dead-letters stale jobs every 30 s. §2.7 adds the WaitGroup.
+	go w.RunReclaim(ctx)
+
 	logger.Info("worker ready")
 
 	for {
@@ -139,8 +143,8 @@ const (
 
 // nextStep decides what the loop does with Next's result. A job that was
 // read is always handled, even if the signal arrived a moment later: Next
-// has already put it in this consumer's pending list, and until the reclaim
-// loop exists (§2.3), nothing else would ever run it or ack it.
+// has already put it in this consumer's pending list. Dropping it would
+// leave it there until the reclaim loop took it 60 to 90 s later.
 func nextStep(err error, stopping bool) step {
 	switch {
 	case err == nil:

@@ -18,10 +18,22 @@ const (
 	Stream = "phishcheck:jobs"
 	// Group is the consumer group every worker joins.
 	Group = "workers"
+	// DeadStream holds jobs given up on after 3 attempts.
+	DeadStream = "phishcheck:jobs:dead"
 
 	fieldJobID = "job_id"
-	maxLen     = 10000           // stream len cap
-	blockFor   = 5 * time.Second // how long next waits before returning ErrNoJob
+	// Extra fields on a dead-letter entry.
+	fieldStreamID       = "stream_id"        // original entry ID
+	fieldAttempts       = "attempts"         // times the job started
+	fieldError          = "error"            // last recorded error
+	fieldDeadLetteredBy = "dead_lettered_by" // worker that gave up
+
+	// claimCount is 1 so each claimed entry runs right away. In a batch,
+	// later entries could sit idle long enough to be claimed twice.
+	claimCount = 1
+
+	maxLen   = 10000           // stream len cap
+	blockFor = 5 * time.Second // how long next waits before returning ErrNoJob
 )
 
 var (
@@ -126,6 +138,71 @@ func (c *Consumer) Next(ctx context.Context) (Job, error) {
 func (c *Consumer) Ack(ctx context.Context, streamID string) error {
 	if err := c.rdb.XAck(ctx, Stream, Group, streamID).Err(); err != nil {
 		return fmt.Errorf("queue: ack %s: %w", streamID, err)
+	}
+	return nil
+}
+
+// Claim runs one XAUTOCLAIM. It moves at most claimCount entries that have
+// been pending longer than minIdle, from whichever consumer held them, to
+// this consumer, and returns them as jobs.
+//
+// start is a cursor into the PEL: pass "0-0" to begin a pass, then the
+// returned next on each later call. next is "0-0" once the whole PEL has
+// been scanned. A claimed entry with no job_id is acked here and left out
+// of jobs, the same as in Next.
+func (c *Consumer) Claim(ctx context.Context, start string, minIdle time.Duration) ([]Job, string, error) {
+	msgs, next, err := c.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+		Stream:   Stream,
+		Group:    Group,
+		Consumer: c.name, // claimed entries now belong to this worker
+		MinIdle:  minIdle,
+		Start:    start,
+		Count:    claimCount,
+	}).Result()
+	if err != nil {
+		return nil, "", fmt.Errorf("queue: autoclaim: %w", err)
+	}
+
+	jobs := make([]Job, 0, len(msgs))
+	for _, m := range msgs {
+		jobID, _ := m.Values[fieldJobID].(string)
+		if jobID == "" {
+			// Ack it, or every pass would claim this bad entry again.
+			if err := c.Ack(ctx, m.ID); err != nil {
+				return nil, "", err
+			}
+			continue
+		}
+		jobs = append(jobs, Job{StreamID: m.ID, JobID: jobID})
+	}
+	return jobs, next, nil
+}
+
+// DeadLetter copies the job to DeadStream and acks the original entry, in
+// one MULTI/EXEC. If the connection drops before EXEC, neither runs and the
+// entry stays pending for the next pass. Once EXEC runs, both have happened.
+// So a job is never acked without a dead-letter record, and never recorded
+// twice.
+func (c *Consumer) DeadLetter(ctx context.Context, job Job, attempts int64, reason string) error {
+	_, err := c.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
+		p.XAdd(ctx, &redis.XAddArgs{
+			Stream: DeadStream,
+			MaxLen: maxLen, // the dead-letter stream gets a cap too
+			Approx: true,
+			ID:     "*",
+			Values: map[string]any{
+				fieldJobID:          job.JobID,
+				fieldStreamID:       job.StreamID,
+				fieldAttempts:       attempts,
+				fieldError:          reason,
+				fieldDeadLetteredBy: c.name,
+			},
+		})
+		p.XAck(ctx, Stream, Group, job.StreamID)
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("queue: dead-letter %s: %w", job.JobID, err)
 	}
 	return nil
 }

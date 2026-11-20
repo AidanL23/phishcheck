@@ -1,5 +1,5 @@
 // Package worker runs one job end to end and decides whether to XACK it.
-// The main loop (cmd/worker) and, from §2.3, the reclaim loop both call
+// The main loop (cmd/worker) and the reclaim loop (reclaim.go) both call
 // Handle, so a reclaimed job goes through exactly the same rules.
 package worker
 
@@ -22,7 +22,7 @@ import (
 
 const (
 	// JobTimeout bounds one attempt: the Redis calls now, DNS from Day 5.
-	// It must stay below the reclaim MinIdle (60 s in §2.3) minus
+	// It must stay below ReclaimMinIdle (reclaim.go) minus
 	// FinishTimeout. Otherwise another worker can XAUTOCLAIM a job this
 	// worker is still finishing, and it runs twice.
 	JobTimeout = 50 * time.Second
@@ -36,7 +36,7 @@ var (
 	// never recorded, so the entry stays pending and reclaim retries it.
 	errWrite = errors.New("redis write failed")
 	// errPanic marks a panic caught by safeProcess. It is not acked, so
-	// reclaim retries it, and §2.3 dead-letters it at 3 attempts.
+	// reclaim retries it, and reclaim.go dead-letters it at MaxAttempts.
 	errPanic = errors.New("handler panicked")
 )
 
@@ -54,7 +54,7 @@ func New(st *store.Store, q *queue.Consumer, id string, logger *slog.Logger) *Wo
 
 // Handle runs one job, writes one summary log line, and acks unless the
 // outcome couldn't be recorded or the job panicked. In those cases the entry
-// stays in the PEL and the reclaim loop (§2.3) picks it up after MinIdle.
+// stays in the PEL and the reclaim loop (reclaim.go) picks it up after MinIdle.
 //
 // ctx must not be the shutdown context (the caller passes
 // context.WithoutCancel). If SIGTERM cancelled these Redis calls partway
