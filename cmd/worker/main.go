@@ -88,8 +88,19 @@ func run() error {
 		return fmt.Errorf("ensure group: %w", err)
 	}
 
-	// Shared by this loop and the reclaim goroutine; safe without a lock.
-	w := worker.New(st, q, workerID, logger)
+	// A sleep at or past JobTimeout makes every job time out and go FAILED,
+	// so the crash demo would show a failure, not a recovery. Refuse it here.
+	if cfg.DebugSleep >= worker.JobTimeout {
+		return fmt.Errorf("config: PHISHCHECK_DEBUG_SLEEP=%s must be below the job timeout (%s)",
+			cfg.DebugSleep, worker.JobTimeout)
+	}
+	if cfg.DebugSleep > 0 {
+		// Warn level, so a sleep someone forgot to turn off stands out in the logs.
+		logger.Warn("debug sleep enabled: every job will stall", "debug_sleep", cfg.DebugSleep.String())
+	}
+
+	// One Worker for the process, shared by the main loop and the reclaim goroutine.
+	w := worker.New(st, q, workerID, logger, worker.Debug{Sleep: cfg.DebugSleep})
 
 	// Retries or dead-letters stale jobs every 30 s. §2.7 adds the WaitGroup.
 	go w.RunReclaim(ctx)

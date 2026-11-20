@@ -46,10 +46,19 @@ type Worker struct {
 	q      *queue.Consumer
 	id     string // worker ID, also the consumer name in the group
 	logger *slog.Logger
+	dbg    Debug // demo switches; zero value = off
 }
 
-func New(st *store.Store, q *queue.Consumer, id string, logger *slog.Logger) *Worker {
-	return &Worker{st: st, q: q, id: id, logger: logger}
+func New(st *store.Store, q *queue.Consumer, id string, logger *slog.Logger, dbg Debug) *Worker {
+	return &Worker{st: st, q: q, id: id, logger: logger, dbg: dbg}
+}
+
+// Debug holds demo-only switches. The zero value turns them all off, and
+// that is what normal runs use.
+type Debug struct {
+	// Sleep stalls every attempt right after StartAttempt marks it RUNNING,
+	// so the worker can be killed mid-job (§2.4). 0 = off.
+	Sleep time.Duration
 }
 
 // Handle runs one job, writes one summary log line, and acks unless the
@@ -162,6 +171,12 @@ func (w *Worker) safeProcess(ctx context.Context, jobID string) (err error) {
 // RUNNING is already set by StartAttempt. Writes are tagged errWrite; reads
 // are not, so an expired email is a normal FAILED, not an endless retry.
 func (w *Worker) process(ctx context.Context, jobID string) error {
+	// Demo only: hold the job in RUNNING long enough to kill -9 this worker.
+	// It waits on ctx, so it can never outlive JobTimeout.
+	if err := w.debugSleep(ctx, jobID); err != nil {
+		return err
+	}
+
 	// The API saved the filename in the job hash when it accepted the upload.
 	job, err := w.st.GetJob(ctx, jobID)
 	if err != nil {
@@ -184,6 +199,7 @@ func (w *Worker) process(ctx context.Context, jobID string) error {
 		WorkerId:   w.id, // which replica did the work (the Day 6 proof)
 		AnalyzedAt: timestamppb.Now(),
 	}
+
 	if err := w.st.PutReport(ctx, jobID, report); err != nil {
 		return fmt.Errorf("put report: %w: %w", errWrite, err)
 	}
@@ -194,4 +210,27 @@ func (w *Worker) process(ctx context.Context, jobID string) error {
 		return fmt.Errorf("set DONE: %w: %w", errWrite, err)
 	}
 	return nil
+}
+
+// debugSleep blocks for w.dbg.Sleep, or until ctx ends. A bare time.Sleep
+// would ignore the job's deadline and SIGTERM. Returning ctx.Err() means a
+// cut-short sleep counts as a timeout in Handle, like any slow job.
+func (w *Worker) debugSleep(ctx context.Context, jobID string) error {
+	d := w.dbg.Sleep
+	if d <= 0 {
+		return nil
+	}
+	// This line is the cue in the demo: once you see it, kill this worker.
+	// (w.logger already carries worker_id.)
+	w.logger.Info("debug sleep: job is RUNNING, kill this worker now to test reclaim",
+		"job_id", jobID, "sleep", d.String())
+
+	t := time.NewTimer(d)
+	defer t.Stop() // release the timer if ctx ends first
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("debug sleep: %w", ctx.Err())
+	}
 }
