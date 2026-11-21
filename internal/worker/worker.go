@@ -59,6 +59,11 @@ type Debug struct {
 	// Sleep stalls every attempt right after StartAttempt marks it RUNNING,
 	// so the worker can be killed mid-job (§2.4). 0 = off.
 	Sleep time.Duration
+	// Panic makes each attempt panic, so the job gets dead-lettered (§2.5).
+	Panic bool
+	// ReclaimIdle overrides ReclaimMinIdle when > 0. Demo only;
+	// cmd/worker rejects unsafe values.
+	ReclaimIdle time.Duration
 }
 
 // Handle runs one job, writes one summary log line, and acks unless the
@@ -175,6 +180,12 @@ func (w *Worker) process(ctx context.Context, jobID string) error {
 	// It waits on ctx, so it can never outlive JobTimeout.
 	if err := w.debugSleep(ctx, jobID); err != nil {
 		return err
+	}
+
+	// Demo only: must be inside safeProcess so recover() catches it.
+	// Handle skips the XACK, and reclaim retries up to MaxAttempts.
+	if w.dbg.Panic {
+		panic("debug panic: PHISHCHECK_DEBUG_PANIC is set")
 	}
 
 	// The API saved the filename in the job hash when it accepted the upload.

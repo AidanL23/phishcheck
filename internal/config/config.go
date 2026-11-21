@@ -20,6 +20,8 @@ type Config struct {
 	TrustedAuthserv string        // PHISHCHECK_TRUSTED_AUTHSERV; empty means trust nothing
 	DNSTimeout      time.Duration // PHISHCHECK_DNS_TIMEOUT
 	DebugSleep      time.Duration // PHISHCHECK_DEBUG_SLEEP; demo only, 0 = off
+	DebugPanic      bool          // PHISHCHECK_DEBUG_PANIC; demo only, false = off
+	ReclaimIdle     time.Duration // PHISHCHECK_RECLAIM_IDLE; 0 = the worker's built-in 60s
 }
 
 // Load reads the configuration from the process environment.
@@ -42,6 +44,10 @@ func load(getenv func(string) string) (Config, error) {
 	// Demo only (§2.4): stall each job after RUNNING so a worker can be
 	// killed mid-job. 0 must be accepted: Day 6's compose file sets "0s".
 	cfg.DebugSleep = nonNegativeDuration(getenv, "PHISHCHECK_DEBUG_SLEEP", 0, &errs)
+	// Demo only (§2.5): every job panics and ends in the dead-letter stream.
+	cfg.DebugPanic = boolean(getenv, "PHISHCHECK_DEBUG_PANIC", false, &errs)
+	// The safe minimum is checked in cmd/worker; config can't import worker.
+	cfg.ReclaimIdle = nonNegativeDuration(getenv, "PHISHCHECK_RECLAIM_IDLE", 0, &errs)
 	return cfg, errors.Join(errs...)
 }
 
@@ -56,6 +62,8 @@ func (c Config) LogValue() slog.Value {
 		slog.String("trusted_authserv", c.TrustedAuthserv),
 		slog.String("dns_timeout", c.DNSTimeout.String()),
 		slog.String("debug_sleep", c.DebugSleep.String()),
+		slog.Bool("debug_panic", c.DebugPanic),
+		slog.String("reclaim_idle", c.ReclaimIdle.String()),
 	)
 }
 
@@ -105,4 +113,19 @@ func nonNegativeDuration(getenv func(string) string, key string, def time.Durati
 		return def
 	}
 	return d
+}
+
+// boolean reads an on/off switch. Accepts 1/0 and true/false;
+// "yes" or "on" is an error, not a silent false.
+func boolean(getenv func(string) string, key string, def bool, errs *[]error) bool {
+	v := getenv(key)
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		*errs = append(*errs, fmt.Errorf("%s=%q: want 1 or 0 (true or false)", key, v))
+		return def
+	}
+	return b
 }

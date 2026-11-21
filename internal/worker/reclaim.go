@@ -31,7 +31,7 @@ const (
 // longer than 30 s delays the next one; passes never pile up.
 func (w *Worker) RunReclaim(ctx context.Context) {
 	w.logger.Info("reclaim loop started",
-		"every", ReclaimEvery.String(), "min_idle", ReclaimMinIdle.String(), "max_attempts", MaxAttempts)
+		"every", ReclaimEvery.String(), "min_idle", w.minIdle().String(), "max_attempts", MaxAttempts)
 
 	w.reclaimPass(ctx)
 
@@ -48,6 +48,14 @@ func (w *Worker) RunReclaim(ctx context.Context) {
 	}
 }
 
+// minIdle is ReclaimMinIdle unless the demo override is set.
+func (w *Worker) minIdle() time.Duration {
+	if w.dbg.ReclaimIdle > 0 {
+		return w.dbg.ReclaimIdle
+	}
+	return ReclaimMinIdle
+}
+
 // reclaimPass walks the whole PEL once, claiming one entry per XAUTOCLAIM
 // call, and runs or dead-letters each entry it claims.
 func (w *Worker) reclaimPass(ctx context.Context) {
@@ -58,7 +66,7 @@ func (w *Worker) reclaimPass(ctx context.Context) {
 			return
 		}
 
-		jobs, next, err := w.q.Claim(ctx, cursor, ReclaimMinIdle)
+		jobs, next, err := w.q.Claim(ctx, cursor, w.minIdle())
 		if err != nil {
 			// A read cut short by shutdown isn't worth an error line.
 			if ctx.Err() == nil {

@@ -99,8 +99,28 @@ func run() error {
 		logger.Warn("debug sleep enabled: every job will stall", "debug_sleep", cfg.DebugSleep.String())
 	}
 
-	// One Worker for the process, shared by the main loop and the reclaim goroutine.
-	w := worker.New(st, q, workerID, logger, worker.Debug{Sleep: cfg.DebugSleep})
+	// An idle at or below one attempt's max time can claim a running job
+	// and run it twice. Only the panic demo (no sleep) is fast enough to allow it.
+	safeIdle := worker.JobTimeout + worker.FinishTimeout
+	if cfg.ReclaimIdle > 0 && cfg.ReclaimIdle <= safeIdle && (!cfg.DebugPanic || cfg.DebugSleep > 0) {
+		return fmt.Errorf("config: PHISHCHECK_RECLAIM_IDLE=%s must be above %s, "+
+			"unless PHISHCHECK_DEBUG_PANIC=1 and PHISHCHECK_DEBUG_SLEEP is unset or 0s",
+			cfg.ReclaimIdle, safeIdle)
+	}
+	if cfg.DebugPanic {
+		logger.Warn("debug panic enabled: every job will panic and end in the dead-letter stream")
+	}
+	if cfg.ReclaimIdle > 0 {
+		// Only guards this process: run the demo with no other workers.
+		logger.Warn("reclaim min idle overridden", "reclaim_idle", cfg.ReclaimIdle.String())
+	}
+
+	// One Worker, shared by the main loop and the reclaim goroutine.
+	w := worker.New(st, q, workerID, logger, worker.Debug{
+		Sleep:       cfg.DebugSleep,
+		Panic:       cfg.DebugPanic,
+		ReclaimIdle: cfg.ReclaimIdle,
+	})
 
 	// Retries or dead-letters stale jobs every 30 s. §2.7 adds the WaitGroup.
 	go w.RunReclaim(ctx)
