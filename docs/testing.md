@@ -80,13 +80,45 @@ panic tests.
   only covers statuses with no timestamps (every line prints `-`). The
   `+0.3ms` / `+1.8s` formatting and the extra RUNNING line on a reclaim are
   checked only by the regexes in `scripts/e2e.sh`, and the reclaim line not at all.
-- **The `kill -9` and dead-letter demos (§2.4, §2.5) are still manual against
-  real Redis.** The worker tests cover the same logic on miniredis.
+- **The `kill -9` and dead-letter demos (§2.4, §2.5) are not in CI.** The
+  worker tests cover the same logic on miniredis. See "Demo runs" below for
+  the last manual run against real Redis.
+- **`phishcheck report` does not show `attempts`.** §2.4 says the report shows
+  `attempts: 2`, but `Report` has no attempts field. The count is on the job
+  hash, in `JobStatus`, and on the `--wait` RUNNING line (`attempt 2`).
 - **An attempt-3 ordinary error with a lost XACK gets dead-lettered.** Its
   state (FAILED, attempts 3) matches a failed `giveUp`, so reclaim
   dead-letters it, while attempts 1 and 2 would just be acked. The result is an
   extra, harmless dead-letter record. Telling the two apart would need another
   field on the job hash.
+
+## Demo runs against real Redis
+
+Last run 2026-11-22 against `redis:7-alpine`, binaries built from
+`feat/queue-hardening`, following §2.4 and §2.5 as written.
+
+**§2.4 crash recovery: pass.** Worker A ran with `PHISHCHECK_DEBUG_SLEEP=45s`
+and took the job, then got `kill -9` 3 s in. Worker B's reclaim loop finished
+it 58 s after the kill (the guide's bound is 90 s). Job hash: DONE,
+`attempts 2`, B's `worker_id`. Report `worker_id` is B. PEL empty afterwards.
+`--wait` printed:
+
+```text
+QUEUED   0.0s
+RUNNING  +1.4ms    (LAPTOP-KB519V12-f8c2)
+RUNNING  +60.7s    (LAPTOP-KB519V12-b80c, attempt 2)
+DONE     +60.7s
+```
+
+**§2.5 dead-letter: pass.** One worker ran alone with `PHISHCHECK_DEBUG_PANIC=1`
+and `PHISHCHECK_RECLAIM_IDLE=5s`. `attempts` reached 2 at +29 s and 3 at +59 s,
+and the job went FAILED at +89 s, one reclaim tick (`ReclaimEvery`, 30 s)
+apart. `XLEN phishcheck:jobs:dead` was 1. The entry held `job_id`,
+`stream_id`, `attempts 3`, the panic message and `dead_lettered_by`. The PEL
+was empty afterwards. The worker logged 3 panics and stayed up, and
+`submit --wait` exited non-zero with the panic reason.
+
+**SIGTERM:** worker B, stopped between the two demos, exited 0.
 
 ## miniredis pitfall: don't simulate outages with SetError
 
