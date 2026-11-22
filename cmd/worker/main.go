@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -41,11 +42,14 @@ func main() {
 }
 
 func run() error {
-	// ctx is cancelled on Ctrl+C or `docker stop` (SIGTERM). It stops the
-	// loop from reading new jobs; a job already read still runs to the end
-	// (see worker.Handle). The rest of graceful shutdown is §2.7.
+	// Cancelled on Ctrl+C or SIGTERM (`docker stop`). Both loops stop taking
+	// new jobs, and run waits for any job in progress (reclaimWG below).
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// After the first signal, a second one kills the worker at once.
+	// That counts as a crash, so reclaim retries the job.
+	context.AfterFunc(ctx, stop)
 
 	// Load reports every invalid env var at once, so a bad deploy fails here
 	// with the full list, not on the first job.
@@ -122,8 +126,10 @@ func run() error {
 		ReclaimIdle: cfg.ReclaimIdle,
 	})
 
-	// Retries or dead-letters stale jobs every 30 s. §2.7 adds the WaitGroup.
-	go w.RunReclaim(ctx)
+	// The main loop runs jobs inline, so only this goroutine can still be
+	// mid-job at shutdown. wg.Go handles Add(1) and Done().
+	var reclaimWG sync.WaitGroup
+	reclaimWG.Go(func() { w.RunReclaim(ctx) })
 
 	logger.Info("worker ready")
 
@@ -132,7 +138,13 @@ func run() error {
 		// that has been read: nextStep always hands it to w.Handle, which
 		// runs it on a context the signal doesn't cancel.
 		if ctx.Err() != nil {
-			logger.Info("worker stopping")
+			logger.Info("worker stopping, waiting for the reclaim loop")
+			// Waits for at most one job, about 60 s (see JobTimeout). Day 6's
+			// stop_grace_period (70 s) must stay above this.
+			reclaimWG.Wait()
+			// Return only after the wait, so the deferred rdb.Close
+			// can't run under a live job.
+			logger.Info("worker stopped")
 			return nil
 		}
 
