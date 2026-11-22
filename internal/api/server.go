@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/AidanL23/phishcheck/gen/go/phishcheck/v1"
 	"github.com/AidanL23/phishcheck/internal/queue"
@@ -242,15 +243,27 @@ func (s *Server) lookupJob(ctx context.Context, id string) (*store.Job, error) {
 }
 
 // toStatus converts the store's Job into the proto JobStatus.
-// attempts and the timestamps get added on Day 2 (§2.2, §2.6).
 func toStatus(j *store.Job) *pb.JobStatus {
 	return &pb.JobStatus{
-		JobId:    j.ID,
-		State:    j.State,
-		WorkerId: j.WorkerID,
-		Attempts: j.Attempts,
-		Error:    j.Error,
+		JobId:       j.ID,
+		State:       j.State,
+		WorkerId:    j.WorkerID,
+		Attempts:    j.Attempts,
+		Error:       j.Error,
+		SubmittedAt: timestamp(j.SubmittedAt),
+		StartedAt:   timestamp(j.StartedAt),
+		FinishedAt:  timestamp(j.FinishedAt),
 	}
+}
+
+// timestamp leaves a zero Time unset (nil). timestamppb.New(time.Time{})
+// would send year 1 instead of "not set", and the CLI couldn't tell a
+// missing time from a real one.
+func timestamp(t time.Time) *timestamppb.Timestamp {
+	if t.IsZero() {
+		return nil
+	}
+	return timestamppb.New(t)
 }
 
 // isTerminal reports whether a job will never change state again.
@@ -292,7 +305,7 @@ func (s *Server) GetReport(ctx context.Context, req *pb.GetReportRequest) (*pb.G
 	return resp, nil
 }
 
-// WatchReport streams a JobStatus every time the job's state changes and
+// WatchReport streams a JobStatus on every state or attempt change and ends
 // ends the stream when the job is DONE or FAILED.
 func (s *Server) WatchReport(req *pb.WatchReportRequest, stream pb.PhishCheckService_WatchReportServer) error {
 	ctx := stream.Context() // cancelled when the client hangs up or the server force-stops
@@ -302,6 +315,7 @@ func (s *Server) WatchReport(req *pb.WatchReportRequest, stream pb.PhishCheckSer
 
 	// No real job is ever UNSPECIFIED, so the first read always sends.
 	last := pb.JobState_JOB_STATE_UNSPECIFIED
+	lastAttempts := int32(0)
 
 	for {
 		job, err := s.lookupJob(ctx, req.GetJobId())
@@ -309,12 +323,13 @@ func (s *Server) WatchReport(req *pb.WatchReportRequest, stream pb.PhishCheckSer
 			return err // bad ID, job expired mid-watch, or Redis error
 		}
 
-		// Only send on a change, so the client isn't flooded every 500 ms.
-		if job.State != last {
+		// Send on a state or attempt change, not every 500 ms. A reclaim keeps
+		// the job RUNNING but bumps attempts, and the client should see it.
+		if job.State != last || job.Attempts != lastAttempts {
 			if err := stream.Send(&pb.WatchReportResponse{Status: toStatus(job)}); err != nil {
 				return err // client went away
 			}
-			last = job.State
+			last, lastAttempts = job.State, job.Attempts
 		}
 
 		// Returning nil closes the stream cleanly: "nothing more is coming".

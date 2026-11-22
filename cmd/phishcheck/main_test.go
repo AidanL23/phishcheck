@@ -683,7 +683,7 @@ func TestWaitForReport(t *testing.T) {
 		if err != nil || got != report {
 			t.Fatalf("got %v, %v", got, err)
 		}
-		if want := "QUEUED\nRUNNING  worker=w1\nDONE  worker=w1\n"; progress.String() != want {
+		if want := "QUEUED   -\nRUNNING  -         (w1)\nDONE     -\n"; progress.String() != want {
 			t.Errorf("progress = %q, want %q", progress.String(), want)
 		}
 	})
