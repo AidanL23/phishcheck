@@ -154,7 +154,9 @@ func run() error {
 			// The BLOCK timed out with nothing to read. Normal while idle; don't log it.
 			continue
 		case stepStop:
-			// Shutdown interrupted the blocking read. The top of the loop exits.
+			// ctx was already cancelled when Next ran, so go-redis refused the
+			// call. A read that was already blocking isn't interrupted: it waits
+			// out the 5 s BLOCK and returns as stepIdle. The top of the loop exits.
 			continue
 		case stepSkip:
 			// Next already acked the bad entry. One bad entry says nothing
