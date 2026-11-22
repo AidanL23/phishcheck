@@ -102,6 +102,24 @@ type Job struct {
 // SetJobState updates the job hash at phishcheck:job:{id} and refreshes its TTL.
 // Empty fields in f are skipped, so earlier values (like filename) are kept.
 func (s *Store) SetJobState(ctx context.Context, id string, state pb.JobState, f JobFields) error {
+	// HSET takes no TTL, so EXPIRE follows it. MULTI/EXEC runs the two back to
+	// back with no other command in between (Redis doesn't roll back, but
+	// EXPIRE can't fail on a key HSET just wrote), so the hash can never be
+	// left without an expiry.
+	_, err := s.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
+		s.SetJobStateIn(ctx, p, id, state, f)
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("store: set job %s to %s: %w", id, state, err)
+	}
+	return nil
+}
+
+// SetJobStateIn queues SetJobState's HSET and EXPIRE on p without running
+// them, so a caller can commit the state change in its own transaction
+// (the worker's dead-letter step does). Errors surface when p executes.
+func (s *Store) SetJobStateIn(ctx context.Context, p redis.Pipeliner, id string, state pb.JobState, f JobFields) {
 	values := map[string]any{fieldState: state.String()} // stored as "JOB_STATE_QUEUED", for readability
 
 	// The state picks the timestamp, so no caller can forget one.
@@ -127,19 +145,8 @@ func (s *Store) SetJobState(ctx context.Context, id string, state pb.JobState, f
 	}
 
 	key := jobKey(id)
-	// HSET takes no TTL, so EXPIRE follows it. MULTI/EXEC runs the two back to
-	// back with no other command in between (Redis doesn't roll back, but
-	// EXPIRE can't fail on a key HSET just wrote), so the hash can never be
-	// left without an expiry.
-	_, err := s.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
-		p.HSet(ctx, key, values)
-		p.Expire(ctx, key, s.ttl)
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("store: set job %s to %s: %w", id, state, err)
-	}
-	return nil
+	p.HSet(ctx, key, values)
+	p.Expire(ctx, key, s.ttl)
 }
 
 // GetJob reads the job hash at phishcheck:job:{id}.

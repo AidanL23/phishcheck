@@ -22,13 +22,18 @@ import (
 
 const (
 	// JobTimeout bounds one attempt: the Redis calls now, DNS from Day 5.
-	// It must stay below ReclaimMinIdle (reclaim.go) minus
-	// FinishTimeout. Otherwise another worker can XAUTOCLAIM a job this
-	// worker is still finishing, and it runs twice.
+	// It is part of MaxHoldTime, which must stay below ReclaimMinIdle.
 	JobTimeout = 50 * time.Second
 	// FinishTimeout bounds the FAILED write and the XACK. They get their
 	// own deadline, so a job that hit JobTimeout is still recorded and acked.
 	FinishTimeout = 5 * time.Second
+	// MaxHoldTime is the longest one worker can hold an entry between
+	// receiving it (XREADGROUP or XAUTOCLAIM, which both reset its idle
+	// time) and its XACK: reclaim's job read, then Handle's attempt and
+	// finish. It must stay below ReclaimMinIdle (reclaim.go), or another
+	// worker can claim an entry this one is still finishing, and the job runs
+	// twice. TestMaxHoldTimeBelowMinIdle enforces it.
+	MaxHoldTime = ReclaimReadTimeout + JobTimeout + FinishTimeout // 57 s
 )
 
 var (
@@ -47,10 +52,14 @@ type Worker struct {
 	id     string // worker ID, also the consumer name in the group
 	logger *slog.Logger
 	dbg    Debug // demo switches; zero value = off
+
+	// jobTimeout is JobTimeout. A field only so tests in this package can
+	// shorten it; nothing else changes it.
+	jobTimeout time.Duration
 }
 
 func New(st *store.Store, q *queue.Consumer, id string, logger *slog.Logger, dbg Debug) *Worker {
-	return &Worker{st: st, q: q, id: id, logger: logger, dbg: dbg}
+	return &Worker{st: st, q: q, id: id, logger: logger, dbg: dbg, jobTimeout: JobTimeout}
 }
 
 // Debug holds demo-only switches. The zero value turns them all off, and
@@ -77,7 +86,7 @@ func (w *Worker) Handle(ctx context.Context, job queue.Job) {
 	start := time.Now()
 	logger := w.logger.With("job_id", job.JobID, "stream_id", job.StreamID)
 
-	jobCtx, cancelJob := context.WithTimeout(ctx, JobTimeout)
+	jobCtx, cancelJob := context.WithTimeout(ctx, w.jobTimeout)
 	attempt, err := w.attempt(jobCtx, job.JobID)
 	// Check the deadline on the context, not the error: go-redis can report
 	// a deadline as a net timeout that doesn't wrap context.DeadlineExceeded.
@@ -99,7 +108,8 @@ func (w *Worker) Handle(ctx context.Context, job queue.Job) {
 
 	case errors.Is(err, errPanic):
 		// Record the reason for the dead-letter entry, but keep RUNNING:
-		// FAILED would end WatchReport while reclaim is still retrying.
+		// FAILED would end WatchReport while reclaim is still retrying, and
+		// reclaim would ack it as an ordinary failure instead of retrying.
 		f := store.JobFields{WorkerID: w.id, Error: err.Error()}
 		if serr := w.st.SetJobState(finishCtx, job.JobID, pb.JobState_JOB_STATE_RUNNING, f); serr != nil {
 			logger.Error("record panic error", "error", serr)
@@ -108,7 +118,7 @@ func (w *Worker) Handle(ctx context.Context, job queue.Job) {
 		return // no XACK
 
 	case timedOut:
-		if !w.fail(finishCtx, logger, job.JobID, fmt.Errorf("timed out after %s: %w", JobTimeout, err)) {
+		if !w.fail(finishCtx, logger, job.JobID, fmt.Errorf("timed out after %s: %w", w.jobTimeout, err)) {
 			return // FAILED write failed: no XACK
 		}
 

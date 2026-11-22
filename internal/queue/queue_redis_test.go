@@ -132,15 +132,18 @@ func TestClaimTakesOnlyIdleEntries(t *testing.T) {
 	}
 
 	// Delivered milliseconds ago, so it can't be idle a minute yet.
-	jobs, _, err := b.Claim(ctx, "0-0", time.Minute)
-	if err != nil || len(jobs) != 0 {
-		t.Fatalf("Claim(1m) = %+v, %v; want nothing", jobs, err)
+	res, err := b.Claim(ctx, "0-0", time.Minute)
+	if err != nil || len(res.Jobs) != 0 {
+		t.Fatalf("Claim(1m) = %+v, %v; want nothing", res, err)
 	}
 
 	// A min idle of 0 makes every pending entry claimable: it stands in for 60 s passing.
-	jobs, _, err = b.Claim(ctx, "0-0", 0)
-	if err != nil || len(jobs) != 1 || jobs[0].JobID != "job-1" {
-		t.Fatalf("Claim(0) = %+v, %v; want job-1", jobs, err)
+	res, err = b.Claim(ctx, "0-0", 0)
+	if err != nil || len(res.Jobs) != 1 || res.Jobs[0].JobID != "job-1" || res.Next != "0-0" {
+		t.Fatalf("Claim(0) = %+v, %v; want job-1 and a finished scan", res, err)
+	}
+	if len(res.Trimmed) != 0 || len(res.Malformed) != 0 {
+		t.Errorf("Claim(0) = %+v; want no trimmed or malformed entries", res)
 	}
 
 	// Still pending (not acked) but now owned by worker-b.
@@ -165,8 +168,13 @@ func TestDeadLetterRecordsAndAcks(t *testing.T) {
 		t.Fatalf("Next: %v", err)
 	}
 
-	if err := c.DeadLetter(ctx, job, 3, "handler panicked"); err != nil {
+	// also's commands commit in the same transaction (the worker writes FAILED this way).
+	also := func(p redis.Pipeliner) { p.HSet(ctx, "phishcheck:job:job-1", "state", "JOB_STATE_FAILED") }
+	if err := c.DeadLetter(ctx, job, 3, "handler panicked", also); err != nil {
 		t.Fatalf("DeadLetter: %v", err)
+	}
+	if got := rdb.HGet(ctx, "phishcheck:job:job-1", "state").Val(); got != "JOB_STATE_FAILED" {
+		t.Errorf("job state = %q; want the also command applied", got)
 	}
 
 	// The original is acked, so reclaim stops retrying it.
@@ -190,6 +198,57 @@ func TestDeadLetterRecordsAndAcks(t *testing.T) {
 		if got := dead[0].Values[k]; got != v {
 			t.Errorf("dead entry %s = %v, want %q", k, got, v)
 		}
+	}
+}
+
+func TestClaimAcksAndReportsMalformedEntry(t *testing.T) {
+	ctx := context.Background()
+	rdb := newTestRedis(t)
+	b := newConsumer(t, rdb, "worker-b")
+
+	// worker-a reads it straight from Redis, so Next doesn't ack it first.
+	if err := rdb.XAdd(ctx, &redis.XAddArgs{Stream: Stream, Values: map[string]any{"wrong": "x"}}).Err(); err != nil {
+		t.Fatalf("XAdd: %v", err)
+	}
+	if err := rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group: Group, Consumer: "worker-a", Streams: []string{Stream, ">"}, Count: 1,
+	}).Err(); err != nil {
+		t.Fatalf("XREADGROUP: %v", err)
+	}
+
+	res, err := b.Claim(ctx, "0-0", 0)
+	if err != nil || len(res.Jobs) != 0 || len(res.Malformed) != 1 {
+		t.Fatalf("Claim = %+v, %v; want one malformed entry and no jobs", res, err)
+	}
+	// Acked, or every pass would claim it again. Reported, so it gets a log line.
+	if n := pendingCount(t, rdb); n != 0 {
+		t.Errorf("pending = %d, want 0", n)
+	}
+}
+
+// Pins down what §2.7 gets wrong: go-redis does not cut a blocking
+// XREADGROUP short when the context is cancelled. Next waits out the BLOCK
+// and returns ErrNoJob, and the worker loop then exits at its ctx check. So
+// shutdown can take up to blockFor (5 s) longer than the in-flight job.
+func TestNextIgnoresCancelUntilBlockEnds(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits out the 5 s BLOCK")
+	}
+	rdb := newTestRedis(t)
+	c := newConsumer(t, rdb, "worker-a")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(200*time.Millisecond, cancel)
+	start := time.Now()
+	_, err := c.Next(ctx)
+	d := time.Since(start)
+
+	if !errors.Is(err, ErrNoJob) {
+		t.Errorf("Next: err = %v, want ErrNoJob (the BLOCK timing out)", err)
+	}
+	if d < blockFor-500*time.Millisecond {
+		t.Errorf("Next returned after %s; go-redis now unblocks on cancel, so update the "+
+			"stepStop comment in cmd/worker and this test", d)
 	}
 }
 

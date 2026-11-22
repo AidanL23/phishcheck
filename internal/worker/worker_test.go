@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -210,9 +211,37 @@ func TestHandleRedisWriteFailureLeavesPending(t *testing.T) {
 	}
 }
 
-// Not covered: the timeout path (FAILED + XACK). JobTimeout is a 50 s
-// constant and FinishTimeout derives from the same parent ctx, so it can't
-// be triggered quickly without making the timeout injectable.
+// A timeout is final, like an ordinary error: FAILED with the reason, then
+// XACK. The FAILED write and the XACK run on their own deadline
+// (FinishTimeout), so they still work after the job's deadline has passed.
+func TestHandleTimeoutFailsAndAcks(t *testing.T) {
+	h := newHarness(t, Debug{Sleep: 5 * time.Second}) // stalls past the timeout
+	h.w.jobTimeout = 100 * time.Millisecond
+	job := h.submit("job-1", true)
+
+	start := time.Now()
+	h.w.Handle(context.Background(), job)
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("Handle took %s; the sleep should have been cut at the timeout", d)
+	}
+
+	j := h.job("job-1")
+	if j.State != pb.JobState_JOB_STATE_FAILED || !strings.Contains(j.Error, "timed out after 100ms") {
+		t.Errorf("job = %s, error %q; want FAILED with a timed-out reason", j.State, j.Error)
+	}
+	if n := h.pending(); n != 0 {
+		t.Errorf("pending = %d, want 0 (acked)", n)
+	}
+}
+
+// If a worker can hold an entry longer than ReclaimMinIdle, another worker
+// can claim it while it's still running, and the job runs twice.
+func TestMaxHoldTimeBelowMinIdle(t *testing.T) {
+	if MaxHoldTime >= ReclaimMinIdle {
+		t.Fatalf("MaxHoldTime %s (read %s + job %s + finish %s) must be below ReclaimMinIdle %s",
+			MaxHoldTime, ReclaimReadTimeout, JobTimeout, FinishTimeout, ReclaimMinIdle)
+	}
+}
 
 // ---- reclaim: the case order ----
 
@@ -243,17 +272,15 @@ func TestReclaimCases(t *testing.T) {
 			wantState: pb.JobState_JOB_STATE_FAILED, wantAttempts: 3, wantDead: true,
 		},
 		{
-			// giveUp wrote FAILED but the dead-letter step failed. The attempts
-			// check must come before the FAILED check, or this is acked with
-			// no dead-letter record.
-			// Known quirk: an ordinary error on attempt 3 whose XACK was lost
-			// leaves the same state, so it is dead-lettered too (attempts 1-2
-			// would just be acked). reclaim can't tell the two apart without
-			// an extra field on the job hash; an extra dead-letter record is
-			// the harmless side of that trade.
-			name: "FAILED at max attempts is dead-lettered", state: pb.JobState_JOB_STATE_FAILED, attempts: "3",
-			errMsg:    "handler panicked: boom",
-			wantState: pb.JobState_JOB_STATE_FAILED, wantAttempts: 3, wantDead: true,
+			// An ordinary error on attempt 3 whose XACK was lost. It's a
+			// recorded failure, not a poison job, so it's acked like on any
+			// other attempt. The FAILED check must come before the attempts
+			// check for this. That's safe because giveUp writes FAILED in the
+			// same transaction as the dead-letter record and the XACK, so it
+			// never leaves a FAILED entry pending.
+			name: "FAILED at max attempts is acked, not dead-lettered", state: pb.JobState_JOB_STATE_FAILED, attempts: "3",
+			errMsg:    "get email: key not found",
+			wantState: pb.JobState_JOB_STATE_FAILED, wantAttempts: 3,
 		},
 		{
 			// fail() wrote FAILED, then its XACK was lost.

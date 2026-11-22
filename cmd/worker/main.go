@@ -103,13 +103,32 @@ func run() error {
 		logger.Warn("debug sleep enabled: every job will stall", "debug_sleep", cfg.DebugSleep.String())
 	}
 
-	// An idle at or below one attempt's max time can claim a running job
-	// and run it twice. Only the panic demo (no sleep) is fast enough to allow it.
-	safeIdle := worker.JobTimeout + worker.FinishTimeout
-	if cfg.ReclaimIdle > 0 && cfg.ReclaimIdle <= safeIdle && (!cfg.DebugPanic || cfg.DebugSleep > 0) {
+	// An idle at or below the longest time a worker holds an entry can claim
+	// a running job and run it twice. Only the panic demo (no sleep) is fast
+	// enough to allow it.
+	safeIdle := worker.MaxHoldTime
+	unsafeIdle := cfg.ReclaimIdle > 0 && cfg.ReclaimIdle <= safeIdle
+	if unsafeIdle && (!cfg.DebugPanic || cfg.DebugSleep > 0) {
 		return fmt.Errorf("config: PHISHCHECK_RECLAIM_IDLE=%s must be above %s, "+
 			"unless PHISHCHECK_DEBUG_PANIC=1 and PHISHCHECK_DEBUG_SLEEP is unset or 0s",
 			cfg.ReclaimIdle, safeIdle)
+	}
+	if unsafeIdle {
+		// With a short idle, this worker would claim other workers' running
+		// jobs, panic on them, and dead-letter real work. Refuse while any
+		// other worker is live. A live worker shows up here within
+		// ReclaimEvery even mid-job, because its reclaim loop keeps ticking.
+		// A worker started after this check isn't caught: keep the demo alone.
+		others, err := q.OtherActiveConsumers(ctx, worker.ReclaimMinIdle)
+		if err != nil {
+			return fmt.Errorf("panic demo safety check: %w", err)
+		}
+		if len(others) > 0 {
+			return fmt.Errorf("config: PHISHCHECK_RECLAIM_IDLE=%s with PHISHCHECK_DEBUG_PANIC=1 "+
+				"would steal and dead-letter jobs from live workers %v; stop them, "+
+				"or wait %s after the last one stopped",
+				cfg.ReclaimIdle, others, worker.ReclaimMinIdle)
+		}
 	}
 	if cfg.DebugPanic {
 		logger.Warn("debug panic enabled: every job will panic and end in the dead-letter stream")
