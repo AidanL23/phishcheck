@@ -44,6 +44,6 @@ CI runs both on every pull request, with the race detector on in the e2e job. [d
 
 - **Plaintext and unauthenticated.** The API listens without TLS or auth, and gRPC reflection is on. It's meant for a local machine only.
 - **A failed enqueue strands a job.** If the email and job hash are written but the XADD fails, the job says QUEUED with nothing on the stream. No worker will ever pick it up; it disappears when its TTL expires.
-- **A pending job can be trimmed away.** The jobs stream is capped at about 10,000 entries. If the cap trims a job that is still pending, Redis drops it, and reclaim can only log it as lost. The job hash stays RUNNING or QUEUED, and `submit --wait` on it never ends.
+- **A pending job can be trimmed away.** The jobs stream is capped at about 10,000 entries. If the cap trims a job that is still pending, Redis drops it, and reclaim can only log it as lost. The job hash stays RUNNING or QUEUED, and `submit --wait` on it never gets a report: it runs until its `--timeout` and exits with an error.
 - **Recovery is slow by design.** A crashed worker's job waits up to about 90 s (60 s idle plus one 30 s reclaim tick) before another worker picks it up.
 - **WatchReport polls.** It re-reads the job hash every 500 ms rather than using pub/sub. That's fine at this scale.
