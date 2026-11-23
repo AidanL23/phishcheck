@@ -1,29 +1,28 @@
-// Command worker reads job IDs from the phishcheck:jobs stream, analyzes the
-// stored email, and writes a Report. On Day 1 the analysis is a stub: every
-// email comes back VERDICT_CLEAN with score 0. The point today is to prove the
-// pipeline works end to end.
+// Command worker reads job IDs from the phishcheck:jobs stream and hands each
+// one to internal/worker, which analyzes the stored email, writes the Report,
+// and decides whether to ack. The analysis is still a stub until Day 3: every
+// email comes back VERDICT_CLEAN with score 0.
 package main
 
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/redis/go-redis/v9"
-	"google.golang.org/protobuf/types/known/timestamppb"
 
-	pb "github.com/AidanL23/phishcheck/gen/go/phishcheck/v1"
 	"github.com/AidanL23/phishcheck/internal/config"
 	"github.com/AidanL23/phishcheck/internal/queue"
 	"github.com/AidanL23/phishcheck/internal/store"
+	"github.com/AidanL23/phishcheck/internal/worker"
 )
 
 func main() {
@@ -43,11 +42,14 @@ func main() {
 }
 
 func run() error {
-	// ctx is cancelled on Ctrl+C or `docker stop` (SIGTERM). It stops the
-	// loop from reading new jobs; a job already read still runs to the end
-	// (see handle). The rest of graceful shutdown is §2.7.
+	// Cancelled on Ctrl+C or SIGTERM (`docker stop`). Both loops stop taking
+	// new jobs, and run waits for any job in progress (reclaimWG below).
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// After the first signal, a second one kills the worker at once.
+	// That counts as a crash, so reclaim retries the job.
+	context.AfterFunc(ctx, stop)
 
 	// Load reports every invalid env var at once, so a bad deploy fails here
 	// with the full list, not on the first job.
@@ -90,14 +92,78 @@ func run() error {
 		return fmt.Errorf("ensure group: %w", err)
 	}
 
+	// A sleep at or past JobTimeout makes every job time out and go FAILED,
+	// so the crash demo would show a failure, not a recovery. Refuse it here.
+	if cfg.DebugSleep >= worker.JobTimeout {
+		return fmt.Errorf("config: PHISHCHECK_DEBUG_SLEEP=%s must be below the job timeout (%s)",
+			cfg.DebugSleep, worker.JobTimeout)
+	}
+	if cfg.DebugSleep > 0 {
+		// Warn level, so a sleep someone forgot to turn off stands out in the logs.
+		logger.Warn("debug sleep enabled: every job will stall", "debug_sleep", cfg.DebugSleep.String())
+	}
+
+	// An idle at or below the longest time a worker holds an entry can claim
+	// a running job and run it twice. Only the panic demo (no sleep) is fast
+	// enough to allow it.
+	safeIdle := worker.MaxHoldTime
+	unsafeIdle := cfg.ReclaimIdle > 0 && cfg.ReclaimIdle <= safeIdle
+	if unsafeIdle && (!cfg.DebugPanic || cfg.DebugSleep > 0) {
+		return fmt.Errorf("config: PHISHCHECK_RECLAIM_IDLE=%s must be above %s, "+
+			"unless PHISHCHECK_DEBUG_PANIC=1 and PHISHCHECK_DEBUG_SLEEP is unset or 0s",
+			cfg.ReclaimIdle, safeIdle)
+	}
+	if unsafeIdle {
+		// With a short idle, this worker would claim other workers' running
+		// jobs, panic on them, and dead-letter real work. Refuse while any
+		// other worker is live. A live worker shows up here within
+		// ReclaimEvery even mid-job, because its reclaim loop keeps ticking.
+		// A worker started after this check isn't caught: keep the demo alone.
+		others, err := q.OtherActiveConsumers(ctx, worker.ReclaimMinIdle)
+		if err != nil {
+			return fmt.Errorf("panic demo safety check: %w", err)
+		}
+		if len(others) > 0 {
+			return fmt.Errorf("config: PHISHCHECK_RECLAIM_IDLE=%s with PHISHCHECK_DEBUG_PANIC=1 "+
+				"would steal and dead-letter jobs from live workers %v; stop them, "+
+				"or wait %s after the last one stopped",
+				cfg.ReclaimIdle, others, worker.ReclaimMinIdle)
+		}
+	}
+	if cfg.DebugPanic {
+		logger.Warn("debug panic enabled: every job will panic and end in the dead-letter stream")
+	}
+	if cfg.ReclaimIdle > 0 {
+		// Only guards this process: run the demo with no other workers.
+		logger.Warn("reclaim min idle overridden", "reclaim_idle", cfg.ReclaimIdle.String())
+	}
+
+	// One Worker, shared by the main loop and the reclaim goroutine.
+	w := worker.New(st, q, workerID, logger, worker.Debug{
+		Sleep:       cfg.DebugSleep,
+		Panic:       cfg.DebugPanic,
+		ReclaimIdle: cfg.ReclaimIdle,
+	})
+
+	// The main loop runs jobs inline, so only this goroutine can still be
+	// mid-job at shutdown. wg.Go handles Add(1) and Done().
+	var reclaimWG sync.WaitGroup
+	reclaimWG.Go(func() { w.RunReclaim(ctx) })
+
 	logger.Info("worker ready")
 
 	for {
 		// Shutdown is checked here, between jobs. It can't interrupt a job
-		// that has been read: nextStep always hands it to handle, and handle
+		// that has been read: nextStep always hands it to w.Handle, which
 		// runs it on a context the signal doesn't cancel.
 		if ctx.Err() != nil {
-			logger.Info("worker stopping")
+			logger.Info("worker stopping, waiting for the reclaim loop")
+			// Waits for at most one job, about 60 s (see JobTimeout). Day 6's
+			// stop_grace_period (70 s) must stay above this.
+			reclaimWG.Wait()
+			// Return only after the wait, so the deferred rdb.Close
+			// can't run under a live job.
+			logger.Info("worker stopped")
 			return nil
 		}
 
@@ -107,7 +173,9 @@ func run() error {
 			// The BLOCK timed out with nothing to read. Normal while idle; don't log it.
 			continue
 		case stepStop:
-			// Shutdown interrupted the blocking read. The top of the loop exits.
+			// ctx was already cancelled when Next ran, so go-redis refused the
+			// call. A read that was already blocking isn't interrupted: it waits
+			// out the 5 s BLOCK and returns as stepIdle. The top of the loop exits.
 			continue
 		case stepSkip:
 			// Next already acked the bad entry. One bad entry says nothing
@@ -122,7 +190,7 @@ func run() error {
 			continue
 		}
 
-		handle(context.WithoutCancel(ctx), logger, st, q, workerID, msg)
+		w.Handle(context.WithoutCancel(ctx), msg)
 	}
 }
 
@@ -139,8 +207,8 @@ const (
 
 // nextStep decides what the loop does with Next's result. A job that was
 // read is always handled, even if the signal arrived a moment later: Next
-// has already put it in this consumer's pending list, and with no reclaim
-// until Day 2, nothing else would ever run it or ack it.
+// has already put it in this consumer's pending list. Dropping it would
+// leave it there until the reclaim loop took it 60 to 90 s later.
 func nextStep(err error, stopping bool) step {
 	switch {
 	case err == nil:
@@ -154,100 +222,6 @@ func nextStep(err error, stopping bool) step {
 	default:
 		return stepBackoff
 	}
-}
-
-const (
-	// jobTimeout bounds process, so a hung Redis call fails the job instead
-	// of stalling the worker. On shutdown, Docker's SIGKILL 10 s after
-	// SIGTERM is still the hard limit.
-	jobTimeout = 30 * time.Second
-	// finishTimeout bounds the FAILED write and the XACK. They get their own
-	// deadline, so a job that hit jobTimeout is still recorded and acked.
-	finishTimeout = 5 * time.Second
-)
-
-// handle runs one job, writes exactly one summary log line, and acks.
-// Day 1 acks success and failure alike. §2.2 changes that.
-//
-// ctx must not be the shutdown context (run passes context.WithoutCancel).
-// If SIGTERM cancelled these Redis calls partway through, the job would be
-// left RUNNING with its entry unacked.
-func handle(ctx context.Context, logger *slog.Logger, st *store.Store, q *queue.Consumer,
-	workerID string, msg queue.Job) {
-
-	start := time.Now()
-	logger = logger.With("job_id", msg.JobID)
-
-	jobCtx, cancelJob := context.WithTimeout(ctx, jobTimeout)
-	err := process(jobCtx, st, workerID, msg.JobID)
-	cancelJob()
-
-	// Convert to integer milliseconds. slog's JSON handler writes a
-	// time.Duration as nanoseconds.
-	durationMS := time.Since(start).Milliseconds()
-
-	finishCtx, cancelFinish := context.WithTimeout(ctx, finishTimeout)
-	defer cancelFinish()
-
-	if err != nil {
-		// Record why it failed so GetReport/WatchReport can show the reason.
-		f := store.JobFields{WorkerID: workerID, Error: err.Error()}
-		if serr := st.SetJobState(finishCtx, msg.JobID, pb.JobState_JOB_STATE_FAILED, f); serr != nil {
-			logger.Error("set FAILED state", "error", serr)
-		}
-		logger.Error("job failed", "duration_ms", durationMS, "error", err)
-	} else {
-		logger.Info("job done", "duration_ms", durationMS)
-	}
-
-	// XACK removes the entry from the Pending Entries List. Without it,
-	// the job stays owned by this worker forever.
-	if err := q.Ack(finishCtx, msg.StreamID); err != nil {
-		logger.Error("ack", "stream_id", msg.StreamID, "error", err)
-	}
-}
-
-// process does the job itself: RUNNING -> read job + email -> stub report -> DONE.
-// Each error is wrapped with the step that failed, so the FAILED reason reads
-// like "get email: ..." and not just "redis: nil".
-func process(ctx context.Context, st *store.Store, workerID, jobID string) error {
-	running := store.JobFields{WorkerID: workerID}
-	if err := st.SetJobState(ctx, jobID, pb.JobState_JOB_STATE_RUNNING, running); err != nil {
-		return fmt.Errorf("set RUNNING: %w", err)
-	}
-
-	// The API saved the filename in the job hash when it accepted the upload.
-	job, err := st.GetJob(ctx, jobID)
-	if err != nil {
-		return fmt.Errorf("get job: %w", err)
-	}
-
-	raw, err := st.GetEmail(ctx, jobID)
-	if err != nil {
-		return fmt.Errorf("get email: %w", err)
-	}
-	sum := sha256.Sum256(raw) // hash of the bytes actually analyzed
-
-	// Stub report. Real findings start on Day 3.
-	report := &pb.Report{
-		JobId:      jobID,
-		Verdict:    pb.Verdict_VERDICT_CLEAN,
-		Score:      0,
-		Filename:   job.Filename,
-		Sha256:     hex.EncodeToString(sum[:]),
-		WorkerId:   workerID, // which replica did the work (the Day 6 proof)
-		AnalyzedAt: timestamppb.Now(),
-	}
-	if err := st.PutReport(ctx, jobID, report); err != nil {
-		return fmt.Errorf("put report: %w", err)
-	}
-
-	// Set DONE last: once the state says DONE, GetReport expects the report to exist.
-	done := store.JobFields{WorkerID: workerID}
-	if err := st.SetJobState(ctx, jobID, pb.JobState_JOB_STATE_DONE, done); err != nil {
-		return fmt.Errorf("set DONE: %w", err)
-	}
-	return nil
 }
 
 // newWorkerID returns "<hostname>-<4 hex chars>", e.g. "LAPTOP-KB519V12-3f9a".

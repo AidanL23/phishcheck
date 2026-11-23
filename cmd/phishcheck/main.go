@@ -28,6 +28,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/AidanL23/phishcheck/gen/go/phishcheck/v1"
 )
@@ -310,6 +311,7 @@ func waitForReport(ctx context.Context, client pb.PhishCheckServiceClient, jobID
 	}
 
 	var last *pb.JobStatus
+	tl := &timeline{w: progress}
 	for {
 		msg, err := watch.Recv()
 		if errors.Is(err, io.EOF) {
@@ -319,12 +321,7 @@ func waitForReport(ctx context.Context, client pb.PhishCheckServiceClient, jobID
 			return nil, fmt.Errorf("watch: %w", rpcErr(err))
 		}
 		last = msg.GetStatus()
-
-		line := enumName(last.GetState(), "JOB_STATE_")
-		if w := last.GetWorkerId(); w != "" {
-			line += "  worker=" + w
-		}
-		fmt.Fprintln(progress, line) // Day 2 (§2.6) adds timings here
+		tl.update(last)
 	}
 
 	// A closed stream doesn't prove the job finished, so check the final
@@ -347,6 +344,70 @@ func waitForReport(ctx context.Context, client pb.PhishCheckServiceClient, jobID
 		return nil, errors.New("job is DONE but the API returned no report") // a server bug; say so loudly
 	}
 	return got.GetReport(), nil
+}
+
+// timeline prints one line per job phase, timed from submitted_at:
+//
+//	QUEUED   0.0s
+//	RUNNING  +0.3ms    (worker-ab12)
+//	DONE     +1.8s
+//
+// A fast job can be DONE before the first poll, so update rebuilds missed
+// phases from the timestamps each status carries.
+type timeline struct {
+	w       io.Writer
+	queued  bool  // QUEUED line printed
+	ran     bool  // a RUNNING line printed
+	attempt int32 // attempt on the last RUNNING line
+}
+
+func (t *timeline) update(st *pb.JobStatus) {
+	base := st.GetSubmittedAt() // nil for jobs submitted before §2.6
+
+	if !t.queued {
+		t.line("QUEUED", base, base, "")
+		t.queued = true
+	}
+
+	// A new attempt (a reclaim) gets its own RUNNING line. The state check
+	// covers jobs with no started_at.
+	started := st.GetStartedAt() != nil || st.GetState() == pb.JobState_JOB_STATE_RUNNING
+	if started && (!t.ran || st.GetAttempts() != t.attempt) {
+		detail := st.GetWorkerId()
+		if n := st.GetAttempts(); n > 1 {
+			detail += fmt.Sprintf(", attempt %d", n)
+		}
+		t.line("RUNNING", base, st.GetStartedAt(), detail)
+		t.ran, t.attempt = true, st.GetAttempts()
+	}
+
+	// The stream ends after DONE or FAILED, so this prints once.
+	if s := st.GetState(); s == pb.JobState_JOB_STATE_DONE || s == pb.JobState_JOB_STATE_FAILED {
+		t.line(enumName(s, "JOB_STATE_"), base, st.GetFinishedAt(), "")
+	}
+}
+
+// line prints one phase with its offset from base, or "-" if either time is
+// missing. %+ keeps the sign so clock skew between hosts shows as negative.
+func (t *timeline) line(state string, base, at *timestamppb.Timestamp, detail string) {
+	offset := "-"
+	if base != nil && at != nil {
+		d := at.AsTime().Sub(base.AsTime())
+		switch {
+		case d == 0:
+			offset = "0.0s" // QUEUED: the zero point
+		case d > -time.Second && d < time.Second:
+			// ms under 1 s, or %.1fs would show +0.0s for the stub worker.
+			offset = fmt.Sprintf("%+.1fms", float64(d)/float64(time.Millisecond))
+		default:
+			offset = fmt.Sprintf("%+.1fs", d.Seconds())
+		}
+	}
+	if detail != "" {
+		detail = "(" + detail + ")"
+	}
+	// TrimRight drops the column padding when detail is empty.
+	fmt.Fprintln(t.w, strings.TrimRight(fmt.Sprintf("%-8s %-9s %s", state, offset, detail), " "))
 }
 
 // printReport writes the human-readable report: a short header, then one

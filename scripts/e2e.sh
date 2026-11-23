@@ -145,7 +145,12 @@ check "exit 0" [ "$RC" -eq 0 ]
 check "first stdout line is the job ID (a UUID)" is_uuid "$JOB"
 check "report says CLEAN, score 0" grep -q '^verdict   CLEAN (score 0)$' <<<"$OUT"
 check "report names the file" grep -q '^file      clean.eml$' <<<"$OUT"
-check "progress on stderr ends at DONE with a worker" grep -Eq '^DONE  worker=.+-[0-9a-f]{4}$' <<<"$ERR"
+# §2.6 moved the worker ID onto the RUNNING line and gave each phase an offset:
+#   QUEUED   0.0s
+#   RUNNING  +0.4ms    (host-ab12)
+#   DONE     +2.1ms
+check "progress shows RUNNING on a worker" grep -Eq '^RUNNING +\+[0-9.]+m?s +\(.+-[0-9a-f]{4}\)$' <<<"$ERR"
+check "progress on stderr ends at DONE with an offset" grep -Eq '^DONE +\+[0-9.]+m?s$' <<<"$(tail -n 1 <<<"$ERR")"
 
 section "report --json: the stored report"
 
@@ -272,7 +277,8 @@ kill -TERM "$WORKER_PID"
 set +e; wait "$WORKER_PID"; WRC=$?; set -e
 WORKER_PID=""
 check "worker exits 0 on SIGTERM (got $WRC)" [ "$WRC" -eq 0 ]
-check "worker logged 'worker stopping'" log_has worker '"msg":"worker stopping"'
+# run()'s last log line: proves it got past reclaimWG.Wait() and returned normally.
+check "worker logged 'worker stopped'" log_has worker '"msg":"worker stopped"'
 
 kill -TERM "$API_PID"
 set +e; wait "$API_PID"; ARC=$?; set -e

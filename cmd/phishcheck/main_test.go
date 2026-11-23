@@ -683,7 +683,7 @@ func TestWaitForReport(t *testing.T) {
 		if err != nil || got != report {
 			t.Fatalf("got %v, %v", got, err)
 		}
-		if want := "QUEUED\nRUNNING  worker=w1\nDONE  worker=w1\n"; progress.String() != want {
+		if want := "QUEUED   -\nRUNNING  -         (w1)\nDONE     -\n"; progress.String() != want {
 			t.Errorf("progress = %q, want %q", progress.String(), want)
 		}
 	})
@@ -726,4 +726,85 @@ func TestWaitForReport(t *testing.T) {
 			t.Errorf("got %v", err)
 		}
 	})
+}
+
+// ---- timeline (§2.6 --wait progress) -------------------------------------------
+
+func TestTimeline(t *testing.T) {
+	base := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) *timestamppb.Timestamp { return timestamppb.New(base.Add(d)) }
+	st := func(s pb.JobState, worker string, attempts int32, started, finished *timestamppb.Timestamp) *pb.JobStatus {
+		return &pb.JobStatus{State: s, WorkerId: worker, Attempts: attempts,
+			SubmittedAt: at(0), StartedAt: started, FinishedAt: finished}
+	}
+	const (
+		Q = pb.JobState_JOB_STATE_QUEUED
+		R = pb.JobState_JOB_STATE_RUNNING
+		D = pb.JobState_JOB_STATE_DONE
+		F = pb.JobState_JOB_STATE_FAILED
+	)
+
+	tests := []struct {
+		name     string
+		statuses []*pb.JobStatus
+		want     string
+	}{
+		{
+			name: "every phase seen, sub-second offsets print as ms",
+			statuses: []*pb.JobStatus{
+				st(Q, "", 0, nil, nil),
+				st(R, "w1", 1, at(300*time.Microsecond), nil),
+				st(D, "w1", 1, at(300*time.Microsecond), at(1800*time.Microsecond)),
+			},
+			want: "QUEUED   0.0s\nRUNNING  +0.3ms    (w1)\nDONE     +1.8ms\n",
+		},
+		{
+			// A fast job can be DONE before the first poll: the missed
+			// phases are rebuilt from the timestamps.
+			name:     "first status is already DONE",
+			statuses: []*pb.JobStatus{st(D, "w1", 1, at(2*time.Second), at(3840*time.Millisecond))},
+			want:     "QUEUED   0.0s\nRUNNING  +2.0s     (w1)\nDONE     +3.8s\n",
+		},
+		{
+			// §2.4: the reclaimed attempt gets its own RUNNING line, which is
+			// the crash-recovery evidence in the README screenshot.
+			name: "reclaim prints a second RUNNING line",
+			statuses: []*pb.JobStatus{
+				st(R, "a", 1, at(1400*time.Microsecond), nil),
+				st(R, "b", 2, at(60700*time.Millisecond), nil),
+				st(D, "b", 2, at(60700*time.Millisecond), at(60702*time.Millisecond)),
+			},
+			want: "QUEUED   0.0s\nRUNNING  +1.4ms    (a)\nRUNNING  +60.7s    (b, attempt 2)\nDONE     +60.7s\n",
+		},
+		{
+			// §2.5: three panics, then dead-lettered.
+			name: "dead-lettered after three attempts",
+			statuses: []*pb.JobStatus{
+				st(R, "p", 1, at(time.Millisecond), nil),
+				st(R, "p", 2, at(29500*time.Millisecond), nil),
+				st(R, "p", 3, at(59500*time.Millisecond), nil),
+				st(F, "p", 3, at(59500*time.Millisecond), at(89500*time.Millisecond)),
+			},
+			want: "QUEUED   0.0s\nRUNNING  +1.0ms    (p)\nRUNNING  +29.5s    (p, attempt 2)\n" +
+				"RUNNING  +59.5s    (p, attempt 3)\nFAILED   +89.5s\n",
+		},
+		{
+			// Clock skew between the API and worker hosts shows as negative.
+			name:     "skew keeps the sign",
+			statuses: []*pb.JobStatus{st(D, "w1", 1, at(-200*time.Millisecond), at(-150*time.Millisecond))},
+			want:     "QUEUED   0.0s\nRUNNING  -200.0ms  (w1)\nDONE     -150.0ms\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			tl := &timeline{w: &buf}
+			for _, s := range tt.statuses {
+				tl.update(s)
+			}
+			if buf.String() != tt.want {
+				t.Errorf("got:\n%s\nwant:\n%s", buf.String(), tt.want)
+			}
+		})
+	}
 }
