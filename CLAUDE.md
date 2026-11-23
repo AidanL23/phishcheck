@@ -10,9 +10,10 @@ Layout: `cmd/api` (gRPC server), `cmd/worker` (queue consumer), `cmd/phishcheck`
 
 - The build guide is the source of truth: a 7-day build (Day 0 to Day 7) with exact designs, rule tables, scoring weights and reference files in Appendix B. Its "Read this first" table lists the design decisions every day depends on.
 - The build checklist tracks progress. Section numbers (§) match the guide.
-- Both live as claude.ai artifacts that I keep editing; the link is on line 3 of each local copy. The live versions are current. Read the guide with the Claude Docs connector and the checklist's ticks from its `progress.json`, through the Artifact tool.
-- `docs/phishcheck-build-guide.md` and `docs/phishcheck-build-checklist.md` are local exports and can lag. The local checklist's boxes are not kept up to date, so never judge progress from it. If a local copy disagrees with the live one, say so.
-- I tick the checklist myself. Don't edit either artifact; when a task finishes, tell me which boxes it covers.
+- Both live as claude.ai artifacts that I keep editing; the link is on line 3 of each local copy. Read the guide with the Claude Docs connector and the checklist's ticks from its `progress.json`, through the Artifact tool.
+- The build guide exists in three copies that must always be identical: the live doc, `docs/phishcheck-build-guide.md`, and the copy in my Windows handoff folder (`Documents/phishcheck-handoff/docs/`). The only allowed difference is line 3: the live doc has a date and a mention there, the local copies the live link. Whenever one changes, make the same change in the other two in the same task. Then export the live doc as markdown and `diff` it against both local copies to confirm. If they disagree and it isn't clear which is right, ask before syncing.
+- `docs/phishcheck-build-checklist.md` is a local export of the checklist and lags; its boxes are never ticked, so never judge progress from it.
+- I tick the checklist myself. Don't edit the checklist artifact; when a task finishes, tell me which boxes it covers.
 - The local copies are kept out of the repo on purpose through `.git/info/exclude`. Never `git add` them, and don't put the artifact links in committed files.
 - Committed docs: `docs/TESTING.md` (what each test covers), `docs/queue-failure-model.md`, `docs/review/CHECKLIST.md` (the end-of-day review) and `docs/review/YYYY-MM-DD-dayN.md` (past reviews).
 
