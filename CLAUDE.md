@@ -8,6 +8,7 @@ Stack: Go, gRPC + protobuf (buf), Redis Streams (consumer group, XAUTOCLAIM, dea
 
 - `docs/phishcheck-build-guide.md` is the source of truth: a 7-day build (Day 0 to Day 7) with exact designs, rule tables, scoring weights and reference files in Appendix B.
 - `docs/phishcheck-build-checklist.md` tracks progress. Section numbers (§) match the guide. Tick boxes as tasks finish.
+- Both files are kept out of the repo on purpose through `.git/info/exclude`, so they exist only in this local clone.
 
 When I ask you to work on a day or a task, read the matching guide section first and follow it. If the guide and the code disagree, say so before changing either.
 
