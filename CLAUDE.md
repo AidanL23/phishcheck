@@ -8,9 +8,12 @@ Layout: `cmd/api` (gRPC server), `cmd/worker` (queue consumer), `cmd/phishcheck`
 
 ## Where the plan lives
 
-- `docs/phishcheck-build-guide.md` is the source of truth: a 7-day build (Day 0 to Day 7) with exact designs, rule tables, scoring weights and reference files in Appendix B. Its "Read this first" table lists the design decisions every day depends on.
-- `docs/phishcheck-build-checklist.md` tracks progress. Section numbers (§) match the guide. Tick boxes as tasks finish. Work added beyond the guide goes in as an indented "Added (not in the guide)" item.
-- Both files are kept out of the repo on purpose through `.git/info/exclude`, so they exist only in this local clone. Never `git add` them.
+- The build guide is the source of truth: a 7-day build (Day 0 to Day 7) with exact designs, rule tables, scoring weights and reference files in Appendix B. Its "Read this first" table lists the design decisions every day depends on.
+- The build checklist tracks progress. Section numbers (§) match the guide.
+- Both live as claude.ai artifacts that I keep editing; the link is on line 3 of each local copy. The live versions are current. Read the guide with the Claude Docs connector and the checklist's ticks from its `progress.json`, through the Artifact tool.
+- `docs/phishcheck-build-guide.md` and `docs/phishcheck-build-checklist.md` are local exports and can lag. The local checklist's boxes are not kept up to date, so never judge progress from it. If a local copy disagrees with the live one, say so.
+- I tick the checklist myself. Don't edit either artifact; when a task finishes, tell me which boxes it covers.
+- The local copies are kept out of the repo on purpose through `.git/info/exclude`. Never `git add` them, and don't put the artifact links in committed files.
 - Committed docs: `docs/TESTING.md` (what each test covers), `docs/queue-failure-model.md`, `docs/review/CHECKLIST.md` (the end-of-day review) and `docs/review/YYYY-MM-DD-dayN.md` (past reviews).
 
 When I ask you to work on a day or a task, read the matching guide section first and follow it. If the guide and the code disagree, say so before changing either.
