@@ -4,3 +4,7 @@ dist/
 coverage.out
 .env
 samples/real/
+
+# NTFS alternate data streams left behind when copying files in from Windows Explorer
+*:Zone.Identifier
+*:OECustomProperty
